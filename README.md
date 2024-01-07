@@ -18,6 +18,13 @@ You may have to install some libraries if they are not already installed :
 
 ### Usage
 
+Personal query
+
+```
+sudo python3 strava.py -a boundary-vorarlberg.geojson -g strava-vorarlberg.geojson
+sudo python3 strava-ride.py -a boundary-vorarlberg.geojson -g strava-ride-vorarlberg.geojson
+```
+
 ```
 Usage: strava.py [-h] [-a AREA] [-d DISTANCE] [-m MINLEVEL] [-o OFFSET] [-z ZOOM] [-s SIZE] [-b TASKS_DB] [-g GEOJSON] [-v] [-q] [-x X] [-y Y] [--debug]
 
