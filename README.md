@@ -21,8 +21,8 @@ You may have to install some libraries if they are not already installed :
 Personal query
 
 ```
-sudo python3 strava.py -a boundary-vorarlberg.geojson -g strava-vorarlberg.geojson
-sudo python3 strava-ride.py -a boundary-vorarlberg.geojson -g strava-ride-vorarlberg.geojson
+sudo python3 strava.py -c run -a boundary-vorarlberg.geojson -g strava-vorarlberg.geojson
+sudo python3 strava.py -c ride -a boundary-vorarlberg.geojson -g strava-vorarlberg.geojson
 ```
 
 ```
