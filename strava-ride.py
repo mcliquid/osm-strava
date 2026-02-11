@@ -16,47 +16,57 @@ from shapely.geometry.polygon import Polygon
 from shapely.geometry import shape, GeometryCollection
 import sqlite3
 
+
 def print_debug(*args):
     if debug:
         print(*args)
+
 
 def print_verbose(*args):
     if verbose:
         print(*args)
 
+
 # Convert geographical coordinates to tile number
 def deg2num(lat_deg, lon_deg, zoom):
-  lat_rad = math.radians(lat_deg)
-  n = 1 << zoom
-  xtile = int((lon_deg + 180.0) / 360.0 * n)
-  ytile = int((1.0 - math.asinh(math.tan(lat_rad)) / math.pi) / 2.0 * n)
-  return xtile, ytile
+    lat_rad = math.radians(lat_deg)
+    n = 1 << zoom
+    xtile = int((lon_deg + 180.0) / 360.0 * n)
+    ytile = int((1.0 - math.asinh(math.tan(lat_rad)) / math.pi) / 2.0 * n)
+    return xtile, ytile
+
 
 # Convert tile number to geographical coordinates
 def num2deg(xtile, ytile, zoom):
-  n = 1 << zoom
-  lon_deg = xtile / n * 360.0 - 180.0
-  lat_rad = math.atan(math.sinh(math.pi * (1 - 2 * ytile / n)))
-  lat_deg = math.degrees(lat_rad)
-  return lat_deg, lon_deg
+    n = 1 << zoom
+    lon_deg = xtile / n * 360.0 - 180.0
+    lat_rad = math.atan(math.sinh(math.pi * (1 - 2 * ytile / n)))
+    lat_deg = math.degrees(lat_rad)
+    return lat_deg, lon_deg
+
 
 RADIUS = 6378137.0 # in meters on the equator
+
 
 # Convert latitude to northing (Pseudo-Mercator projection)
 def lat2y(lat):
     return math.log(math.tan(math.pi / 4 + math.radians(lat) / 2)) * RADIUS
 
+
 # Convert longitude to easting (Pseudo-Mercator projection)
 def lon2x(lon):
     return math.radians(lon) * RADIUS
+
 
 # Convert northing (Pseudo-Mercator projection) to latitude
 def y2lat(y):
     return math.degrees(2 * math.atan(math.exp (y / RADIUS)) - math.pi / 2.0)
 
+
 # Convert easting (Pseudo-Mercator projection) to longitude
 def x2lon(x):
     return math.degrees(x / RADIUS)
+
 
 # Get bounding box of a Strava tile in geographical coordinates
 def get_geo_bbox(x ,y, zoom):
@@ -123,7 +133,7 @@ def check_trace_area(image, row, col, target_color, min_size, size):
 # Check if Strava file is available in cache and download it if not in cache
 def fetch_strava_tile(zoom, x, y):
     cache_dir = '/var/cache/strava'
-    cache_file_path = os.path.join(cache_dir, str(zoom), str(x), str(y)+'.png')
+    cache_file_path = os.path.join(cache_dir, activity, str(zoom), str(x), str(y)+'.png')
     if os.path.isfile(cache_file_path):
         if os.path.getsize(cache_file_path) > 0:
             print_verbose("Tile in cache:", cache_file_path)
@@ -131,14 +141,14 @@ def fetch_strava_tile(zoom, x, y):
         else:
             print_verbose("Empty tile in cache :", cache_file_path)
             return None
-    dir1 = os.path.join(cache_dir, str(zoom))
+    dir1 = os.path.join(cache_dir, activity, str(zoom))
     if not os.path.isdir(dir1):
-        os.mkdir(dir1)
+        os.makedirs(dir1, exist_ok=True)
     dir2 = os.path.join(dir1, str(x))
     if not os.path.isdir(dir2):
         os.mkdir(dir2)
 
-    url =  f'https://strava-heatmap.tiles.freemap.sk/ride/hot/{zoom}/{x}/{y}.png'
+    url = f'https://strava-heatmap.tiles.freemap.sk/{activity}/hot/{zoom}/{x}/{y}.png'
     print_verbose("Downloading Strava tile at", url)
     try:
         r = requests.get(url, allow_redirects=True)
@@ -164,19 +174,19 @@ def overpass_request(lat_ul_merc, lon_ul_merc, lat_lr_merc, lon_lr_merc):
     lat_ul = y2lat(lat_ul_merc)
     lon_lr = x2lon(lon_lr_merc)
     bbox = f'{lat_lr},{lon_ul},{lat_ul},{lon_lr}'
-    url = "https://overpass-api.de/api/interpreter?data=" + requests.utils.quote(f'''
-    way[highway]({bbox});out geom;
-    relation[highway]({bbox});>;out geom;
-    way[railway]({bbox});out geom;
-    relation[railway]({bbox});>;out geom;
-    way[route=ferry]({bbox});out geom;
-    relation[route=ferry]({bbox});>;out geom;
-    way[leisure~"track|pitch|sports_centre|stadium"]({bbox});out geom;
-    relation[leisure~"track|pitch|sports_centre|stadium"]({bbox});>;out geom;
-    way["piste:type"]({bbox});out geom;
-    relation["piste:type"]({bbox});>;out geom;
-    way["aerialway"]({bbox});out geom;
-    relation["aerialway"]({bbox});>;out geom;''')
+    url = "https://overpass-api.de/api/interpreter?data=" + requests.utils.quote(
+        f'way[highway]({bbox});out geom;'
+        f'relation[highway]({bbox});>;out geom;'
+        f'way[railway]({bbox});out geom;'
+        f'relation[railway]({bbox});>;out geom;'
+        f'way[leisure~"track|pitch|sports_centre|stadium"]({bbox});out geom;'
+        f'relation[leisure~"track|pitch|sports_centre|stadium"]({bbox});>;out geom;'
+        f'way["piste:type"]({bbox});out geom;'
+        f'relation["piste:type"]({bbox});>;out geom;'
+        f'way[route=ferry]({bbox});out geom;'
+        f'relation[route=ferry]({bbox});>;out geom;'
+        f'way[aerialway]({bbox});out geom;'
+        f'relation[aerialway]({bbox});>;out geom;')
 
     for retries in range(10):
             r = requests.get(url, allow_redirects=True, stream=True)
@@ -299,6 +309,7 @@ parser.add_argument("-m", "--minlevel", type=int, default = 100, help="Minimum S
 parser.add_argument("-d", "--distance", type=int, default = 35, help="Maximum distance between Strava hot point and OSM way")
 parser.add_argument("-s", "--size", type=int, default = 20, help="Minimum size of Strava trace (in pixels)")
 parser.add_argument("-z", "--zoom", default = 15, help="Strava zoom level (10-15)")
+parser.add_argument("-c", "--activity", default='run', help="Strava activity (default=run)")
 parser.add_argument("-o", "--offset", type=int, help="Strava tile offset (0-3)")
 parser.add_argument("-b", "--tasks_db", help="Tasks database")
 parser.add_argument("-g", "--geojson", help="Output file")
@@ -318,6 +329,9 @@ threshold = args.minlevel
 print_verbose("Threshold = ", threshold)
 zoom=args.zoom
 min_size=args.size
+print_verbose("Minimum size = ", min_size)
+activity=args.activity
+print_verbose("Activity = ", activity)
 tasks_db = args.tasks_db
 
 # Create output file
