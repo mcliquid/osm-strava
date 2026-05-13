@@ -17,6 +17,27 @@ from shapely.geometry import shape, GeometryCollection
 import sqlite3
 
 
+# #region agent log
+def _agent_debug_ndjson(location, message, data, hypothesis_id, run_id=None):
+    try:
+        log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug-b10916.log")
+        payload = {
+            "sessionId": "b10916",
+            "timestamp": int(time.time() * 1000),
+            "location": location,
+            "message": message,
+            "data": data,
+            "hypothesisId": hypothesis_id,
+        }
+        if run_id is not None:
+            payload["runId"] = run_id
+        with open(log_path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+# #endregion
+
+
 def print_debug(*args):
     if debug:
         print(*args)
@@ -46,6 +67,11 @@ def num2deg(xtile, ytile, zoom):
 
 
 RADIUS = 6378137.0  # in meters on the equator
+
+# overpass-api.de rejects the default python-requests User-Agent with HTTP 406 (fair-use policy).
+_OVERPASS_HTTP_HEADERS = {
+    "User-Agent": "osm-strava/1.0 (OSM/Strava heatmap comparison; +https://github.com/osm-strava/osm-strava)",
+}
 
 
 # Convert latitude to northing (Pseudo-Mercator projection)
@@ -212,8 +238,52 @@ def overpass_request(lat_ul_merc, lon_ul_merc, lat_lr_merc, lon_lr_merc):
         'nwr[route=ferry];);out geom;')
 
     for retries in range(10):
-        r = requests.get(url, allow_redirects=True, stream=True)
-        osm_root = ET.fromstring(r.content)
+        r = requests.get(
+            url,
+            allow_redirects=True,
+            stream=True,
+            headers=_OVERPASS_HTTP_HEADERS,
+        )
+        raw = r.content
+        preview = raw[:2500].decode("utf-8", errors="replace")
+        # #region agent log
+        _agent_debug_ndjson(
+            "strava.py:overpass_request",
+            "overpass response before XML parse",
+            {
+                "retry_idx": retries,
+                "http_status": r.status_code,
+                "content_type": (r.headers.get("Content-Type") or "")[:200],
+                "body_len": len(raw),
+                "preview_head": preview[:800],
+                "looks_like_html": preview.lstrip().lower().startswith("<!doctype html")
+                or preview.lstrip().lower().startswith("<html"),
+                "bbox_deg": [lat_lr, lon_ul, lat_ul, lon_lr],
+            },
+            "H1-H4",
+            run_id="post-fix",
+        )
+        # #endregion
+        try:
+            osm_root = ET.fromstring(raw)
+        except ET.ParseError as exc:
+            # #region agent log
+            lines = preview.splitlines()
+            line9 = lines[8] if len(lines) >= 9 else ""
+            _agent_debug_ndjson(
+                "strava.py:overpass_request",
+                "XML ParseError from Overpass body",
+                {
+                    "exc": str(exc),
+                    "http_status": r.status_code,
+                    "line9_sample": line9[:500],
+                    "preview_tail": preview[-400:] if len(preview) > 400 else preview,
+                },
+                "H2-H3",
+                run_id="post-fix",
+            )
+            # #endregion
+            raise
         if osm_root.find('meta') is not None:   # Check that the result is not empty
             return osm_root
         time.sleep(5)
