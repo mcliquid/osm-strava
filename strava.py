@@ -73,6 +73,11 @@ _OVERPASS_HTTP_HEADERS = {
     "User-Agent": "osm-strava/1.0 (OSM/Strava heatmap comparison; +https://github.com/osm-strava/osm-strava)",
 }
 
+_STRAVA_TILE_BROWSER_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:137.0) Gecko/20100101 Firefox/137.0",
+}
+_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+
 
 # Convert latitude to northing (Pseudo-Mercator projection)
 def lat2y(lat):
@@ -168,7 +173,9 @@ def check_trace_area(image, row, col, target_color, min_size, size):
 # Check if Strava file is available in cache and download it if not in cache
 def fetch_strava_tile(zoom, x, y):
     cache_dir = '/var/cache/strava'
-    cache_file_path = os.path.join(cache_dir, activity, str(zoom), str(x), str(y) + '.png')
+    cache_file_path = os.path.join(
+        cache_dir, activity, strava_tile_backend, str(zoom), str(x), str(y) + '.png'
+    )
     if os.path.isfile(cache_file_path):
         if os.path.getsize(cache_file_path) > 0:
             print_verbose("Tile in cache:", cache_file_path)
@@ -176,25 +183,31 @@ def fetch_strava_tile(zoom, x, y):
         else:
             print_verbose("Empty tile in cache :", cache_file_path)
             return None
-    dir1 = os.path.join(cache_dir, activity, str(zoom))
+    dir1 = os.path.join(cache_dir, activity, strava_tile_backend, str(zoom))
     if not os.path.isdir(dir1):
         os.makedirs(dir1, exist_ok=True)
     dir2 = os.path.join(dir1, str(x))
     if not os.path.isdir(dir2):
         os.mkdir(dir2)
 
-    url = f'https://strava-heatmap.tiles.freemap.sk/{activity}/hot/{zoom}/{x}/{y}.png'
+    if strava_tile_backend == "nakarte":
+        url = (
+            "https://proxy.nakarte.me/https/heatmap-external-a.strava.com/tiles-auth/"
+            f"{activity}/hot/{zoom}/{x}/{y}.png?px=256"
+        )
+    else:
+        url = f"https://strava-heatmap.tiles.freemap.sk/{activity}/hot/{zoom}/{x}/{y}.png"
     print_verbose("Downloading Strava tile at", url)
     retries = 10
     while retries > 0:
         try:
-            r = requests.get(url, allow_redirects=True, headers={'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64; rv:137.0) Gecko/20100101 Firefox/137.0'})
+            r = requests.get(url, allow_redirects=True, headers=_STRAVA_TILE_BROWSER_HEADERS)
             r.raise_for_status()
         except requests.exceptions.HTTPError as e:
             print_debug("Status code =", e.response.status_code)
             if e.response.status_code == 404:
-                open(cache_file_path, 'wb').write(r.content)    # Write an empty file
-                break
+                print_verbose("Strava tile missing (404), skipping", zoom, x, y)
+                return None
             elif e.response.status_code == 403:
                 print("Wait for 10 seconds", file=sys.stderr)
                 time.sleep(10)
@@ -202,8 +215,14 @@ def fetch_strava_tile(zoom, x, y):
         except requests.exceptions.RequestException as e:
             print(e, file=sys.stderr)
         else:
-            open(cache_file_path, 'wb').write(r.content)
-            break
+            body = r.content
+            if len(body) >= 24 and body.startswith(_PNG_SIGNATURE):
+                open(cache_file_path, 'wb').write(body)
+                break
+            print(
+                f"Warning: Strava response is not a PNG ({len(body)} bytes), retrying",
+                file=sys.stderr,
+            )
         retries = retries - 1
         print("Retries: ", retries, file=sys.stderr)
         time.sleep(1)
@@ -483,7 +502,14 @@ parser.add_argument("-s", "--size", type=int, default=20,
 parser.add_argument("-z", "--zoom", default=15,
                     help="Strava zoom level (10-15)")
 parser.add_argument("-c", "--activity", default='run',
-                    help="Strava activity (default=run)")
+                    help="Strava activity (default=run). Use e.g. 'all' for combined heatmap with --strava-tiles nakarte.")
+parser.add_argument(
+    "--strava-tiles",
+    dest="strava_tile_backend",
+    choices=("freemap", "nakarte"),
+    default="freemap",
+    help="Strava tile server: 'freemap' (default) or 'nakarte' (proxy to heatmap-external-a.strava.com, px=256).",
+)
 parser.add_argument("-o", "--offset", type=int,
                     help="Strava tile offset (0-3)")
 parser.add_argument("-b", "--tasks_db",
@@ -514,6 +540,8 @@ min_size = args.size
 print_verbose("Minimum size = ", min_size)
 activity = args.activity
 print_verbose("Activity = ", activity)
+strava_tile_backend = args.strava_tile_backend
+print_verbose("Strava tiles =", strava_tile_backend)
 tasks_db = args.tasks_db
 
 # Create output file
