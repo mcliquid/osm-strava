@@ -38,4 +38,4 @@ Remaining candidates are:
 
 Do not reconstruct suppression from metric thresholds for that snapshot.
 The CSV flags (`suppressed_parallel_osm`, `suppressed_ferry`,
-`written_to_geojson`) are authoritative.
+`suppressed_heat_halo`, `written_to_geojson`) are authoritative.

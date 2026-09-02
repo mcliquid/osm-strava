@@ -33,19 +33,17 @@ Validated production usage for Mallorca:
 Optional false-positive filters are **off by default**. They do not change the
 35 m mask, threshold, or `min_size`.
 
-Last measured Mallorca snapshot (same OSM extract, no task database):
+Last measured Mallorca snapshot (fresh OSM extract, no task database):
 
 | Mode | Accepted | GeoJSON |
 |---|---:|---:|
-| Baseline (no suppression) | 189 | 189 |
-| `--suppress-parallel-osm` | 189 | 63 |
-| `--suppress-ferry` | 189 | 175 |
-| both flags | 189 | 54 |
+| Baseline (no suppression) | 171 | 171 |
+| `--suppress-parallel-osm` `--suppress-ferry` | 171 | 51 |
+| those plus `--suppress-heat-halo` | 171 | 15 |
 
 `accepted` means the candidate passed the normal detector (size and requested-area
 tests). Optional suppression may omit it from GeoJSON afterwards; diagnostics
-still record `accepted=true`. The Mallorca counts below predate the area-boundary
-and `highway=construction` masking fixes and may change on a rerun.
+still record `accepted=true`.
 
 ## Requirements
 
@@ -95,7 +93,7 @@ python strava.py -c ride --strava-tiles strava -z 14 `
   -g output.geojson
 ```
 
-With both optional suppressors and diagnostics:
+With optional suppressors and diagnostics:
 
 ```
 python strava.py -c ride --strava-tiles strava -z 14 `
@@ -106,6 +104,7 @@ python strava.py -c ride --strava-tiles strava -z 14 `
   --stats-json run-stats.json `
   --suppress-parallel-osm `
   --suppress-ferry `
+  --suppress-heat-halo `
   -v
 ```
 
@@ -146,6 +145,7 @@ From `strava.py --help` (defaults in parentheses):
 | `--diagnostics` | Optional per-candidate CSV (does not change detection) |
 | `--suppress-parallel-osm` | Opt-in parallel-OSM suppression (default off) |
 | `--suppress-ferry` | Opt-in ferry-candidate suppression (default off) |
+| `--suppress-heat-halo` | Opt-in lateral heat-halo suppression (default off) |
 
 Area polygons can be downloaded from [OSM-Boundaries](https://osm-boundaries.com/).
 Example files live in `boundaries/`. Candidate output is clipped to the polygon
@@ -155,9 +155,10 @@ The intensity colour scale is shown in `docs/palette.png`.
 
 ## Optional suppression
 
-Both flags are **opt-in** and default **off**. They run after normal detection
+These flags are **opt-in** and default **off**. They run after normal detection
 on accepted in-area candidates only. Flood-fill and task IDs are unchanged. A
-candidate can match both rules; it is counted once in the GeoJSON union.
+candidate can match more than one rule; it is counted once in the GeoJSON union.
+Each rule still increments its own counter.
 
 ### `--suppress-parallel-osm`
 
@@ -181,15 +182,47 @@ Diagnostics column: `suppressed_ferry`.
 
 Mallorca (measured): 14 ferry matches, GeoJSON 175 if used alone.
 
+### `--suppress-heat-halo`
+
+Omits accepted candidates whose leftover heatmap sits in a warm lateral halo
+of a nearby parallel OSM way, rather than in an independent corridor:
+
+    between_heat_ratio >= 1.0
+
+`between_heat_ratio` is the same diagnostic metric: median unmasked heatmap
+along the segment from the candidate centroid to the nearest point on the
+best parallel OSM way, divided by the candidate component mean. Blank values
+do not match. This does **not** change the 35 m mask, thresholds, or
+candidate IDs. Diagnostics column: `suppressed_heat_halo`.
+
+Do not use `>= 0.8`: that threshold has no extra Not_An_Issue yield and
+removed a Too_Hard control. Cover-only and `heat_ratio_p90`-only rules are
+unsafe.
+
+Validated on MapRoulette challenge 56715 (47 leftover Not_An_Issue after the
+existing production filters): `>= 1.0` removes 36/47 NAI. The reconstructed
+Fixed control `14/8308/6230/389/806` (`between_heat_ratio = 0`) and all four
+Too_Hard controls survive.
+
 ### Combined statistics
 
-With both flags, Mallorca measured:
+With `--suppress-parallel-osm` and `--suppress-ferry` (Mallorca, measured):
 
-- parallel 126
-- ferry 14
-- overlap 5
-- union suppressed 135
-- GeoJSON 54
+- parallel 119
+- ferry 1
+- overlap 0
+- union suppressed 120
+- GeoJSON 51
+
+Adding `--suppress-heat-halo` on the same extract:
+
+- heat-halo matches 150 (predicate; many already match parallel)
+- heat-halo additional suppressed 36 (would still have reached GeoJSON after parallel/ferry)
+- union suppressed 156
+- GeoJSON 15
+
+On challenge 56715 labels, those 36 extra GeoJSON omissions are exactly
+36/47 leftover Not_An_Issue. Parallel and ferry counts are unchanged.
 
 Summary fields:
 
@@ -199,15 +232,20 @@ Summary fields:
 - accepted (passed size and requested-area tests; before optional suppression)
 - suppressed parallel to OSM
 - suppressed ferry traces
+- suppressed heat-halo traces (predicate matches)
+- heat-halo additional suppressed (GeoJSON removals not already caught by a previous enabled rule)
 - suppression overlap
 - total suppressed
 - GeoJSON features (after suppression and `-b` exclusions)
 
-Known Mallorca controls that must remain in GeoJSON with both flags:
+Known Mallorca controls that must remain in GeoJSON with the existing
+parallel and ferry flags (and with `--suppress-heat-halo` when still detected):
 
 - `14/8305/6233/875/927`
-- `14/8308/6230/389/806`
 - `14/8306/6225/102/938`
+
+`14/8308/6230/389/806` is mapped in current OSM, so it is no longer detected.
+Its reconstructed `between_heat_ratio` is 0 and would not match heat-halo.
 
 ## Local OSM data (`osm-data/`)
 
@@ -350,7 +388,7 @@ Main diagnostic groups (not a full column list):
 - nearest ferry / construction
 - follow / parallel geometry vs local OSM
 - area membership (`inside_area`)
-- suppression status (`suppressed_parallel_osm`, `suppressed_ferry`, `written_to_geojson`)
+- suppression status (`suppressed_parallel_osm`, `suppressed_ferry`, `suppressed_heat_halo`, `written_to_geojson`)
 
 Generated analysis CSV/GeoJSON files are gitignored.
 

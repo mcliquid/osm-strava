@@ -109,6 +109,7 @@ DIAGNOSTIC_COLUMNS = [
     "written_to_geojson",
     "suppressed_parallel_osm",
     "suppressed_ferry",
+    "suppressed_heat_halo",
 ]
 
 
@@ -334,6 +335,7 @@ def _local_component_direction(all_xy, sample_xy, global_vec, radius=_LOCAL_COMP
 PARALLEL_OSM_FOLLOW100_MIN = 0.70
 PARALLEL_OSM_PARALLEL15_MIN = 0.70
 FERRY_SUPPRESS_MAX_M = 500.0
+HEAT_HALO_BETWEEN_MIN = 1.0
 
 
 def _parse_metric_float(value):
@@ -400,6 +402,76 @@ def should_suppress_ferry(ferry_distance_m):
     """True if nearest_ferry_distance_m is populated and <= 500. Blank does not match."""
     dist = _parse_metric_float(ferry_distance_m)
     return dist is not None and dist <= FERRY_SUPPRESS_MAX_M
+
+
+def lateral_metrics_from_component_pixels(
+    values,
+    rows,
+    cols,
+    bbox_merc,
+    pixel_size_m,
+    lookup,
+    heatmap_snapshot,
+    heatmap_unmasked=None,
+):
+    """Lateral heatmap metrics for already extracted component pixels.
+
+    Shared by diagnostics CSV export and production --suppress-heat-halo.
+    Numerical behaviour matches the previous inline build_diagnostic_row path.
+    """
+    if values.size == 0 or bbox_merc is None:
+        return _empty_lateral_metrics()
+    merc_xy = pixels_to_mercator(rows, cols, bbox_merc, pixel_size_m)
+    _pca_angle, _pca_elong, axis_vec = component_pca(merc_xy)
+    cand_mean = float(np.mean(values)) if values.size else None
+    cand_p90 = float(np.percentile(values, 90)) if values.size else None
+    heat_for_corridor = heatmap_unmasked if heatmap_unmasked is not None else heatmap_snapshot
+    try:
+        return component_lateral_osm_metrics(
+            merc_xy,
+            axis_vec,
+            lookup,
+            heat_for_corridor,
+            bbox_merc,
+            pixel_size_m,
+            cand_mean,
+            cand_p90,
+        )
+    except Exception:
+        return _empty_lateral_metrics()
+
+
+def component_between_heat_ratio(
+    heatmap,
+    heatmap_unmasked,
+    peak_row,
+    peak_col,
+    threshold,
+    bbox_merc,
+    pixel_size,
+    lookup,
+):
+    """between_heat_ratio for a peak, same definition as the diagnostics CSV."""
+    values, rows, cols = extract_component_pixels(
+        heatmap, peak_row, peak_col, threshold
+    )
+    metrics = lateral_metrics_from_component_pixels(
+        values,
+        rows,
+        cols,
+        bbox_merc,
+        pixel_size,
+        lookup,
+        heatmap,
+        heatmap_unmasked,
+    )
+    return metrics.get("between_heat_ratio", "")
+
+
+def should_suppress_heat_halo(between_heat_ratio):
+    """True if between_heat_ratio >= 1.0. Blank metrics do not match."""
+    value = _parse_metric_float(between_heat_ratio)
+    return value is not None and value >= HEAT_HALO_BETWEEN_MIN
 
 
 def _empty_follow_metrics():
@@ -972,6 +1044,7 @@ def build_diagnostic_row(
     heatmap_unmasked=None,
     suppressed_parallel_osm=False,
     suppressed_ferry=False,
+    suppressed_heat_halo=False,
     inside_area=True,
 ):
     candidate_id = f"{zoom}/{tile_x}/{tile_y}/{peak_row}/{peak_col}"
@@ -1038,26 +1111,18 @@ def build_diagnostic_row(
     row.update(follow)
 
     if n_pixels and bbox_merc is not None:
-        merc_xy = pixels_to_mercator(rows, cols, bbox_merc, pixel_size_m)
-        _pca_angle, _pca_elong, axis_vec = component_pca(merc_xy)
-        cand_mean = float(np.mean(values)) if values.size else None
-        cand_p90 = float(np.percentile(values, 90)) if values.size else None
-        heat_for_corridor = heatmap_unmasked if heatmap_unmasked is not None else heatmap_snapshot
-        try:
-            row.update(
-                component_lateral_osm_metrics(
-                    merc_xy,
-                    axis_vec,
-                    lookup,
-                    heat_for_corridor,
-                    bbox_merc,
-                    pixel_size_m,
-                    cand_mean,
-                    cand_p90,
-                )
+        row.update(
+            lateral_metrics_from_component_pixels(
+                values,
+                rows,
+                cols,
+                bbox_merc,
+                pixel_size_m,
+                lookup,
+                heatmap_snapshot,
+                heatmap_unmasked,
             )
-        except Exception:
-            row.update(_empty_lateral_metrics())
+        )
     else:
         row.update(_empty_lateral_metrics())
 
@@ -1068,6 +1133,7 @@ def build_diagnostic_row(
     row["written_to_geojson"] = _bool_csv(written_to_geojson)
     row["suppressed_parallel_osm"] = _bool_csv(suppressed_parallel_osm)
     row["suppressed_ferry"] = _bool_csv(suppressed_ferry)
+    row["suppressed_heat_halo"] = _bool_csv(suppressed_heat_halo)
     return row
 
 

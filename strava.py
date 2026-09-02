@@ -27,9 +27,11 @@ from diagnostics import (
     DiagnosticOsmLookup,
     DiagnosticWriter,
     build_diagnostic_row,
+    component_between_heat_ratio,
     component_osm_follow_metrics,
     nearest_ferry_distance_m,
     should_suppress_ferry,
+    should_suppress_heat_halo,
     should_suppress_parallel_osm,
 )
 
@@ -79,6 +81,8 @@ class RunStats:
         self.detections_accepted = 0
         self.parallel_osm_suppressed = 0
         self.ferry_suppressed = 0
+        self.heat_halo_suppressed = 0
+        self.heat_halo_additional_suppressed = 0
         self.suppression_overlap = 0
         self.total_suppressed = 0
         self.geojson_features = 0
@@ -101,6 +105,7 @@ class RunStats:
         self.diagnostic_rows = 0
         self.suppress_parallel_osm = False
         self.suppress_ferry = False
+        self.suppress_heat_halo = False
 
     def note_warning(self):
         self.warnings_total += 1
@@ -160,10 +165,13 @@ class RunStats:
             "detections_accepted": self.detections_accepted,
             "parallel_osm_suppressed": self.parallel_osm_suppressed,
             "ferry_suppressed": self.ferry_suppressed,
+            "heat_halo_suppressed": self.heat_halo_suppressed,
+            "heat_halo_additional_suppressed": self.heat_halo_additional_suppressed,
             "suppression_overlap": self.suppression_overlap,
             "total_suppressed": self.total_suppressed,
             "suppress_parallel_osm": self.suppress_parallel_osm,
             "suppress_ferry": self.suppress_ferry,
+            "suppress_heat_halo": self.suppress_heat_halo,
             "geojson_features": self.geojson_features,
             "warnings_total": self.warnings_total,
             "started": started,
@@ -224,7 +232,31 @@ class RunStats:
             line("Accepted before suppression", _format_int(self.detections_accepted))
             line("Suppressed parallel to OSM", _format_int(self.parallel_osm_suppressed))
             line("Suppressed ferry traces", _format_int(self.ferry_suppressed))
+            if self.suppress_heat_halo:
+                line("Suppressed heat-halo traces", _format_int(self.heat_halo_suppressed))
+                line(
+                    "Heat-halo additional suppressed",
+                    _format_int(self.heat_halo_additional_suppressed),
+                )
             line("Suppression overlap", _format_int(self.suppression_overlap))
+            line("Total suppressed", _format_int(self.total_suppressed))
+        elif self.suppress_parallel_osm and self.suppress_heat_halo:
+            line("Accepted before suppression", _format_int(self.detections_accepted))
+            line("Suppressed parallel to OSM", _format_int(self.parallel_osm_suppressed))
+            line("Suppressed heat-halo traces", _format_int(self.heat_halo_suppressed))
+            line(
+                "Heat-halo additional suppressed",
+                _format_int(self.heat_halo_additional_suppressed),
+            )
+            line("Total suppressed", _format_int(self.total_suppressed))
+        elif self.suppress_ferry and self.suppress_heat_halo:
+            line("Accepted before suppression", _format_int(self.detections_accepted))
+            line("Suppressed ferry traces", _format_int(self.ferry_suppressed))
+            line("Suppressed heat-halo traces", _format_int(self.heat_halo_suppressed))
+            line(
+                "Heat-halo additional suppressed",
+                _format_int(self.heat_halo_additional_suppressed),
+            )
             line("Total suppressed", _format_int(self.total_suppressed))
         elif self.suppress_parallel_osm:
             line("Accepted before parallel suppression", _format_int(self.detections_accepted))
@@ -232,6 +264,13 @@ class RunStats:
         elif self.suppress_ferry:
             line("Accepted before ferry suppression", _format_int(self.detections_accepted))
             line("Suppressed ferry traces", _format_int(self.ferry_suppressed))
+        elif self.suppress_heat_halo:
+            line("Accepted before heat-halo suppression", _format_int(self.detections_accepted))
+            line("Suppressed heat-halo traces", _format_int(self.heat_halo_suppressed))
+            line(
+                "Heat-halo additional suppressed",
+                _format_int(self.heat_halo_additional_suppressed),
+            )
         else:
             line("Accepted detections", _format_int(self.detections_accepted))
         print("", file=stream)
@@ -259,6 +298,7 @@ diagnostic_writer = None
 diagnostic_osm = None
 suppress_parallel_osm = False
 suppress_ferry = False
+suppress_heat_halo = False
 requested_area = None
 requested_area_prepared = None
 
@@ -1370,7 +1410,10 @@ def plot_osm_items(items, draw, width, pixel_size):
 def setup_diagnostic_osm(loaded_index):
     global diagnostic_osm
     need_lookup = (
-        diagnostic_writer is not None or suppress_parallel_osm or suppress_ferry
+        diagnostic_writer is not None
+        or suppress_parallel_osm
+        or suppress_ferry
+        or suppress_heat_halo
     )
     if not need_lookup or loaded_index is None:
         diagnostic_osm = None
@@ -1454,7 +1497,11 @@ def check_strava_tile(polygon_area, x, y, zoom):
         # Keep the raw Strava tile for diagnostic corridor sampling. Detection
         # continues to use the OSM-masked image below; this does not change
         # masking, thresholds, or candidate IDs.
-        heatmap_unmasked = np.array(image) if diagnostic_writer is not None else None
+        heatmap_unmasked = (
+            np.array(image)
+            if diagnostic_writer is not None or suppress_heat_halo
+            else None
+        )
         plot_osm_items(osm_items, draw, width, pixel_size)
 
         if debug:
@@ -1463,7 +1510,11 @@ def check_strava_tile(polygon_area, x, y, zoom):
         data = np.array(image)
         tile_had_accepted = False
         tile_lookup = diagnostic_osm
-        need_component_geometry = diagnostic_writer is not None or suppress_parallel_osm
+        need_component_geometry = (
+            diagnostic_writer is not None
+            or suppress_parallel_osm
+            or suppress_heat_halo
+        )
         need_lookup = need_component_geometry or suppress_ferry
         if need_lookup and tile_lookup is None:
             tile_lookup = DiagnosticOsmLookup(osm_items, [])
@@ -1480,6 +1531,7 @@ def check_strava_tile(polygon_area, x, y, zoom):
             written_to_geojson = False
             suppressed_parallel = False
             suppressed_ferry_flag = False
+            suppressed_heat_halo_flag = False
             too_small = size <= min_size
             inside_area = candidate_inside_requested_area(result[0], result[1])
             accepted = (not too_small) and inside_area
@@ -1540,9 +1592,43 @@ def check_strava_tile(polygon_area, x, y, zoom):
                             f"Suppressed ferry: "
                             f"{zoom}/{x}/{y}/{int(max_index[0])}/{int(max_index[1])}"
                         )
+                if suppress_heat_halo:
+                    try:
+                        between_ratio = component_between_heat_ratio(
+                            heatmap_snapshot,
+                            heatmap_unmasked,
+                            int(max_index[0]),
+                            int(max_index[1]),
+                            threshold,
+                            bbox_merc,
+                            pixel_size,
+                            tile_lookup,
+                        )
+                        suppressed_heat_halo_flag = should_suppress_heat_halo(
+                            between_ratio
+                        )
+                    except Exception as exc:
+                        print(
+                            f"Warning: heat-halo suppression failed: {exc}",
+                            file=sys.stderr,
+                        )
+                        run_stats.note_warning()
+                        suppressed_heat_halo_flag = False
+                    if suppressed_heat_halo_flag:
+                        run_stats.heat_halo_suppressed += 1
+                        if not suppressed_parallel and not suppressed_ferry_flag:
+                            run_stats.heat_halo_additional_suppressed += 1
+                        print_verbose(
+                            f"Suppressed heat halo: "
+                            f"{zoom}/{x}/{y}/{int(max_index[0])}/{int(max_index[1])}"
+                        )
                 if suppressed_parallel and suppressed_ferry_flag:
                     run_stats.suppression_overlap += 1
-                if suppressed_parallel or suppressed_ferry_flag:
+                if (
+                    suppressed_parallel
+                    or suppressed_ferry_flag
+                    or suppressed_heat_halo_flag
+                ):
                     run_stats.total_suppressed += 1
                 # print(f"geo:{result[1]},{result[0]}?z={zoom}")
                 print_verbose(f"https://www.openstreetmap.org/?mlat={result[1]}&"
@@ -1566,6 +1652,7 @@ def check_strava_tile(polygon_area, x, y, zoom):
                 if (
                     not suppressed_parallel
                     and not suppressed_ferry_flag
+                    and not suppressed_heat_halo_flag
                     and status != "Too_Hard"
                     and status != "Not_an_Issue"
                 ):
@@ -1625,6 +1712,7 @@ def check_strava_tile(polygon_area, x, y, zoom):
                         bbox_merc=bbox_merc,
                         suppressed_parallel_osm=suppressed_parallel,
                         suppressed_ferry=suppressed_ferry_flag,
+                        suppressed_heat_halo=suppressed_heat_halo_flag,
                     )
                     diagnostic_writer.write_row(row)
                     run_stats.diagnostic_rows = diagnostic_writer.rows_written
@@ -1719,6 +1807,15 @@ parser.add_argument(
         "object. Default off; candidate-level only, does not widen the OSM mask buffer."
     ),
 )
+parser.add_argument(
+    "--suppress-heat-halo",
+    action="store_true",
+    help=(
+        "Opt-in: omit accepted candidates whose heatmap sits in a lateral heat halo "
+        "of a nearby parallel OSM way (between_heat_ratio>=1.0). Default off; does "
+        "not change masking, thresholds, or candidate IDs."
+    ),
+)
 
 args = parser.parse_args()
 
@@ -1778,6 +1875,10 @@ suppress_ferry = bool(args.suppress_ferry)
 run_stats.suppress_ferry = suppress_ferry
 if suppress_ferry:
     print_verbose("Suppress ferry = on (nearest_ferry_distance_m<=500)")
+suppress_heat_halo = bool(args.suppress_heat_halo)
+run_stats.suppress_heat_halo = suppress_heat_halo
+if suppress_heat_halo:
+    print_verbose("Suppress heat halo = on (between_heat_ratio>=1.0)")
 
 # Create output file
 if args.geojson is not None:

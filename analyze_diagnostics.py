@@ -1605,18 +1605,35 @@ def export_remaining_v2_geojson(path, remaining_rows):
 def production_flag_counts(accepted):
     parallel = sum(1 for row in accepted if parse_bool(row.get("suppressed_parallel_osm")))
     ferry = sum(1 for row in accepted if parse_bool(row.get("suppressed_ferry")))
+    heat_halo = sum(1 for row in accepted if parse_bool(row.get("suppressed_heat_halo")))
+    heat_halo_additional = sum(
+        1
+        for row in accepted
+        if parse_bool(row.get("suppressed_heat_halo"))
+        and not parse_bool(row.get("suppressed_parallel_osm"))
+        and not parse_bool(row.get("suppressed_ferry"))
+    )
     overlap = sum(
         1
         for row in accepted
         if parse_bool(row.get("suppressed_parallel_osm")) and parse_bool(row.get("suppressed_ferry"))
+    )
+    union = sum(
+        1
+        for row in accepted
+        if parse_bool(row.get("suppressed_parallel_osm"))
+        or parse_bool(row.get("suppressed_ferry"))
+        or parse_bool(row.get("suppressed_heat_halo"))
     )
     written = sum(1 for row in accepted if parse_bool(row.get("written_to_geojson")))
     return {
         "accepted": len(accepted),
         "parallel": parallel,
         "ferry": ferry,
+        "heat_halo": heat_halo,
+        "heat_halo_additional": heat_halo_additional,
         "overlap": overlap,
-        "union": parallel + ferry - overlap,
+        "union": union,
         "written": written,
     }
 
@@ -1627,8 +1644,10 @@ def run_remaining_v2_analysis(remaining, accepted, diagnostics, args):
     print_kv("Accepted", counts["accepted"])
     print_kv("suppressed_parallel_osm", counts["parallel"])
     print_kv("suppressed_ferry", counts["ferry"])
+    print_kv("suppressed_heat_halo", counts["heat_halo"])
+    print_kv("heat_halo_additional_suppressed", counts["heat_halo_additional"])
     print_kv("suppression_overlap", counts["overlap"])
-    print_kv("union (parallel + ferry - overlap)", counts["union"])
+    print_kv("union (any optional suppressor)", counts["union"])
     print_kv("written_to_geojson", counts["written"])
     print(
         "Remaining is defined as accepted==true AND written_to_geojson==true. "
