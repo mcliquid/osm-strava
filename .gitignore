@@ -17,6 +17,12 @@ osm-data/*.osm
 osm-data/*.osm.pbf
 osm-data/backups/
 osm-data/.osmupdate-temp/
+osm-data/.update-tmp/
+osm-data/sources/
+osm-data/**/backups/
+osm-data/**/.source-stamp
+osm-data/**/*.http
+osm-data/**/*.tmp
 osm-databackups/
 
 # Detector / diagnostics outputs (regenerated locally)

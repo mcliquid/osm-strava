@@ -28,7 +28,7 @@ Validated production usage for Mallorca:
 - tiles: direct Strava Global Heatmap (`--strava-tiles strava`)
 - zoom: `14`
 - OSM mask distance: **35 m** (`-d`, default)
-- local OSM XML: `osm-data/islas-baleares-current.osm`
+- local OSM XML: `osm-data/mallorca/current.osm`
 
 Optional false-positive filters are **off by default**. They do not change the
 35 m mask, threshold, or `min_size`.
@@ -77,12 +77,11 @@ Never commit Strava cookies. `.strava-cookie` is gitignored.
 
 ### Local OSM updates (optional, WSL)
 
-`update-osm.ps1` / `update-osm.sh` keep the Balearic extract current. In WSL you
-need:
+`update-osm.ps1` / `update-osm.sh` refresh detector extracts from Geofabrik.
+In WSL you need:
 
 - `osmium-tool` (`osmium`)
-- `osmctools` (`osmupdate`)
-- `wget`
+- `curl`
 - `python3`
 
 ## Usage
@@ -92,7 +91,7 @@ Baseline Mallorca run (no suppression):
 ```
 python strava.py -c ride --strava-tiles strava -z 14 `
   -a boundaries/mallorca.geojson `
-  --osm-file osm-data/islas-baleares-current.osm `
+  --osm-file osm-data/mallorca/current.osm `
   -g output.geojson
 ```
 
@@ -101,7 +100,7 @@ With both optional suppressors and diagnostics:
 ```
 python strava.py -c ride --strava-tiles strava -z 14 `
   -a boundaries/mallorca.geojson `
-  --osm-file osm-data/islas-baleares-current.osm `
+  --osm-file osm-data/mallorca/current.osm `
   -g output.geojson `
   --diagnostics diagnostics.csv `
   --stats-json run-stats.json `
@@ -114,7 +113,7 @@ Single-tile debug (instead of `-a`):
 
 ```
 python strava.py -c ride --strava-tiles strava -z 14 -x 8305 -y 6233 `
-  --osm-file osm-data/islas-baleares-current.osm -g tile.geojson
+  --osm-file osm-data/mallorca/current.osm -g tile.geojson
 ```
 
 Without `--osm-file`, OSM is loaded from Overpass (cached under `cache/`).
@@ -212,32 +211,85 @@ Known Mallorca controls that must remain in GeoJSON with both flags:
 
 ## Local OSM data (`osm-data/`)
 
+Geofabrik `*-latest.osm.pbf` files are downloaded (with HTTP conditional
+requests), then clipped to the detector boundary with:
+
+```
+osmium extract --strategy=complete_ways --polygon boundaries/<region>.geojson
+```
+
+`complete_ways` keeps every node referenced by a way that intersects the
+area, so the detector XML is referentially complete at the boundary. The old
+`osmupdate -B` clip left tens of thousands of missing node references.
+
+Geofabrik extracts are typically about a day behind OSM, not minutely like
+Planet replication or Overpass.
+
 ```
 osm-data/
-    islas-baleares-current.osm.pbf   # managed extract (gitignored)
-    islas-baleares-current.osm       # XML for --osm-file (gitignored)
-    islas-baleares.poly              # clip polygon (tracked)
-    backups/                         # previous PBFs (gitignored, limited)
+    sources/                         # Geofabrik *-latest.osm.pbf (gitignored)
+    mallorca/current.osm.pbf         # detector extract
+    mallorca/current.osm             # XML for --osm-file
+    mallorca/backups/                # previous extracts (limited)
+    bodenseekreis/current.osm.pbf
+    bodenseekreis/current.osm
+    islas-baleares.poly              # leftover from the old osmupdate workflow
 ```
 
-Update from PowerShell:
+Regions are defined in `osm-regions.conf`. From PowerShell (any working
+directory):
 
 ```
-.\update-osm.ps1
+.\update-osm.ps1 mallorca
+.\update-osm.ps1 bodenseekreis
+.\update-osm.ps1 --list
+.\update-osm.ps1 --show-config mallorca
 ```
 
-The script runs `update-osm.sh` in WSL. It:
+Equivalent in WSL / Git Bash:
 
-- applies Planet **minutely** replication with `osmupdate`
-- always clips with `islas-baleares.poly` (`-B`)
-- validates timestamps, regional bbox, and object counts
-- backs up the previous PBF (keeps a small number of backups)
-- converts PBF → XML with `osmium cat`
-- validates XML provenance/counts against the PBF
+```
+./update-osm.sh mallorca
+./update-osm.sh bodenseekreis
+```
 
-The clipped regional file may not have complete references for objects that
-cross the polygon boundary. That is acceptable for Mallorca detection, but the
-file is not a generally referentially-complete OSM extract.
+`--force` rebuilds the extract and XML even if the Geofabrik source is
+unchanged.
+
+The updater:
+
+1. HEAD-checks the Geofabrik URL (ETag / Last-Modified / Content-Length)
+2. skips the download when the local source already matches
+3. skips extract and XML conversion when the derived files already match
+   that source plus the current boundary
+4. otherwise downloads to a temp file, validates, then extracts and converts
+5. runs `osmium check-refs` on the extract (fails on missing way→node refs)
+6. replaces `current.osm.pbf` / `current.osm` only after validation
+
+Use the generated XML with `strava.py`:
+
+```
+python strava.py -c ride --strava-tiles strava -z 14 `
+  -a boundaries/mallorca.geojson `
+  --osm-file osm-data/mallorca/current.osm `
+  -g output.geojson
+```
+
+```
+python strava.py -c ride --strava-tiles strava -z 14 `
+  -a boundaries/bodenseekreis.geojson `
+  --osm-file osm-data/bodenseekreis/current.osm `
+  -g output.geojson
+```
+
+**Migration:** previous Mallorca commands used
+`osm-data/islas-baleares-current.osm`. That file is not deleted automatically.
+Point `--osm-file` at `osm-data/mallorca/current.osm` after the first
+`.\update-osm.ps1 mallorca` run. The leftover
+`osm-data/bodenseekreis-current.osm` is likewise unused by the new layout.
+
+The first Bodenseekreis Geofabrik source is Regierungsbezirk Tübingen
+(~120 MB). The updater will not fetch it until you run that region.
 
 ## Diagnostics and research
 
@@ -296,4 +348,5 @@ next round. Combine with `-b` on later passes.
 - `diagnostics.py` — shared geometry / diagnostics / suppression helpers
 - `analyze_diagnostics.py` — offline rule analysis
 - `strava-ride.py` — older ride-oriented script (Overpass only; not the current detector)
-- `update-osm.ps1` / `update-osm.sh` — Balearic OSM extract updater
+- `update-osm.ps1` / `update-osm.sh` — Geofabrik OSM extract updater
+- `osm-regions.conf` — region URLs, boundaries, and output paths

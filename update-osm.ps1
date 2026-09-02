@@ -1,5 +1,11 @@
 #Requires -Version 5.1
 # Start the WSL OSM update script from any working directory.
+#
+#   .\update-osm.ps1 mallorca
+#   .\update-osm.ps1 bodenseekreis
+#   .\update-osm.ps1 --list
+#   .\update-osm.ps1 --show-config mallorca
+#
 $ErrorActionPreference = "Stop"
 
 $repoRoot = $PSScriptRoot
