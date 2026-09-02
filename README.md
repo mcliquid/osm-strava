@@ -232,6 +232,8 @@ Planet replication or Overpass.
 ```
 osm-data/
     sources/                         # Geofabrik *-latest.osm.pbf (gitignored)
+    sources/*-working.osm.pbf        # unclipped --fresh working copy
+    sources/*-working.state          # last replication timestamps / diff count
     mallorca/current.osm.pbf         # detector extract
     mallorca/current.osm             # XML for --osm-file
     mallorca/backups/                # previous extracts (limited)
@@ -257,20 +259,56 @@ Equivalent in WSL / Git Bash:
 ./update-osm.sh bodenseekreis
 ```
 
-`--force` rebuilds the extract and XML even if the Geofabrik source is
-unchanged.
+`--force` rebuilds the extract and XML even if the source and boundary have
+not changed.
+
+### Geofabrik daily vs `--fresh`
+
+**Default** (`.\update-osm.ps1 mallorca`) uses the Geofabrik `*-latest.osm.pbf`
+file as-is. That extract is typically about a day behind OSM.
+
+Geofabrik also publishes regional `.osc.gz` files under the extract's
+`osmosis_replication_base_url`. Those follow the Geofabrik generation cycle,
+so they are **not** true minutely updates.
+
+**`--fresh`** is opt-in. It keeps an *unclipped* working copy of the Geofabrik
+bootstrap (`…-working.osm.pbf`) and advances it with official
+[planet.openstreetmap.org](https://planet.openstreetmap.org/replication/minute/)
+replication (`osmupdate`, no polygon clip). The detector file is still produced
+afterwards with `osmium extract --strategy=complete_ways`. Official planet diffs
+must not be applied to an already clipped Mallorca/Bodenseekreis detector
+extract.
+
+Planet diffs are global. Applied without clipping they add out-of-region objects
+to the working copy; `complete_ways` drops those again at extract time. Do
+**not** clip the diffs with `osmupdate -B` — that was the old missing-node-ref
+failure. If a `check-refs` run fails, the previous detector files are kept.
+
+The working copy grows over time because it accumulates worldwide creates. A
+newer Geofabrik extract automatically re-bootstraps it. `--bootstrap` (with
+`--fresh`) forces that rebuild when you want a clean regional base.
+
+```
+.\update-osm.ps1 mallorca --fresh
+.\update-osm.ps1 mallorca --fresh --bootstrap
+```
+
+A second `--fresh` run only downloads newly published planet diffs. osmupdate
+keeps those diffs under `osm-data/.update-tmp/osmupdate/`.
 
 The updater:
 
 1. HEAD-checks the Geofabrik URL (ETag / Last-Modified / Content-Length)
-2. skips the download when the local source already matches
-3. skips extract and XML conversion when the derived files already match
-   that source plus the current boundary
-4. otherwise downloads to a temp file, validates, then extracts and converts
-5. runs `osmium check-refs` on the extract (fails on missing way→node refs)
-6. checks that the GeoJSON boundary lies in the region safety window and
+2. skips the Geofabrik download when the local source already matches
+3. in `--fresh` mode, copies/updates the unclipped working PBF from planet
+   replication, then still extracts with `complete_ways`
+4. skips extract and XML conversion when the derived files already match
+   that input plus the current boundary
+5. otherwise extracts and converts from a temp file
+6. runs `osmium check-refs` on the extract (fails on missing way→node refs)
+7. checks that the GeoJSON boundary lies in the region safety window and
    that the extract overlaps that boundary
-7. replaces `current.osm.pbf` / `current.osm` only after validation
+8. replaces `current.osm.pbf` / `current.osm` only after validation
 
 Use the generated XML with `strava.py`:
 

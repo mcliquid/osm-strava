@@ -11,6 +11,12 @@ from shapely.strtree import STRtree
 
 # Diagnostic-only neighbourhood around a component (Web Mercator metres).
 _OSM_NEIGHBOURHOOD_M = 100.0
+_LATERAL_OSM_SEARCH_M = 250.0
+_LATERAL_PARALLEL_DEG = 15.0
+_LATERAL_PARALLEL_WIDE_DEG = 30.0
+_LATERAL_COVER_BANDS_M = (50.0, 75.0, 100.0, 150.0, 200.0, 250.0)
+_LATERAL_MAX_GEOMS_PER_SAMPLE = 32
+_LATERAL_HEAT_MAX_SAMPLES = 80
 _MAX_COMPONENT_SAMPLES = 160
 _TANGENT_WINDOW_M = 20.0
 _LOCAL_COMPONENT_RADIUS_M = 30.0
@@ -72,6 +78,30 @@ DIAGNOSTIC_COLUMNS = [
     "osm_parallel_angle_median_deg",
     "osm_parallel_fraction_15deg",
     "osm_parallel_fraction_30deg",
+    "nearest_parallel_osm_distance_m",
+    "nearest_parallel_osm_min_m",
+    "nearest_parallel_osm_angle_deg",
+    "nearest_parallel_osm_id",
+    "nearest_parallel_osm_highway",
+    "nearest_parallel_osm_name",
+    "parallel_osm_cover_frac_50m",
+    "parallel_osm_cover_frac_75m",
+    "parallel_osm_cover_frac_100m",
+    "parallel_osm_cover_frac_150m",
+    "parallel_osm_cover_frac_200m",
+    "parallel_osm_cover_frac_250m",
+    "parallel_osm_cover_frac_250m_30deg",
+    "candidate_axis_heat_mean",
+    "candidate_axis_heat_p90",
+    "candidate_axis_heat_n",
+    "parallel_osm_heat_mean",
+    "parallel_osm_heat_p90",
+    "parallel_osm_heat_n",
+    "parallel_osm_heat_ratio_mean",
+    "parallel_osm_heat_ratio_p90",
+    "between_heat_median",
+    "between_heat_ratio",
+    "heat_halo_score",
     "raw_candidate",
     "too_small",
     "accepted",
@@ -529,6 +559,349 @@ class DiagnosticOsmLookup:
             return []
         return [store["geoms"][int(i)] for i in idxs]
 
+    def items_geoms_near_envelope(self, minx, miny, maxx, maxy, padding=_LATERAL_OSM_SEARCH_M):
+        """Diagnostic-only: OSM items+geoms near an envelope. Does not affect masking."""
+        store = self._all
+        if not store["items"] or store["tree"] is None:
+            return []
+        env = shapely_box(minx - padding, miny - padding, maxx + padding, maxy + padding)
+        indices = store["tree"].query(env, predicate="intersects")
+        idxs = np.asarray(indices).reshape(-1)
+        if idxs.size == 0:
+            return []
+        return [(store["items"][int(i)], store["geoms"][int(i)]) for i in idxs]
+
+
+def _empty_lateral_metrics(zero_cover=False):
+    cover = _fmt_float(0.0, 4) if zero_cover else ""
+    return {
+        "nearest_parallel_osm_distance_m": "",
+        "nearest_parallel_osm_min_m": "",
+        "nearest_parallel_osm_angle_deg": "",
+        "nearest_parallel_osm_id": "",
+        "nearest_parallel_osm_highway": "",
+        "nearest_parallel_osm_name": "",
+        "parallel_osm_cover_frac_50m": cover,
+        "parallel_osm_cover_frac_75m": cover,
+        "parallel_osm_cover_frac_100m": cover,
+        "parallel_osm_cover_frac_150m": cover,
+        "parallel_osm_cover_frac_200m": cover,
+        "parallel_osm_cover_frac_250m": cover,
+        "parallel_osm_cover_frac_250m_30deg": cover,
+        "candidate_axis_heat_mean": "",
+        "candidate_axis_heat_p90": "",
+        "candidate_axis_heat_n": "",
+        "parallel_osm_heat_mean": "",
+        "parallel_osm_heat_p90": "",
+        "parallel_osm_heat_n": "",
+        "parallel_osm_heat_ratio_mean": "",
+        "parallel_osm_heat_ratio_p90": "",
+        "between_heat_median": "",
+        "between_heat_ratio": "",
+        "heat_halo_score": "",
+    }
+
+
+def _tile_box(bbox_merc):
+    # bbox_merc = (max_y, min_x, min_y, max_x) from get_merc_bbox()
+    return shapely_box(bbox_merc[1], bbox_merc[2], bbox_merc[3], bbox_merc[0])
+
+
+def _merc_to_rowcol(mx, my, bbox_merc, pixel_size):
+    col = (mx - bbox_merc[1]) / pixel_size
+    row = (bbox_merc[0] - my) / pixel_size
+    return row, col
+
+
+def _sample_heatmap_merc(heatmap, mx, my, bbox_merc, pixel_size):
+    if heatmap is None or bbox_merc is None:
+        return None
+    row, col = _merc_to_rowcol(mx, my, bbox_merc, pixel_size)
+    r = int(round(row))
+    c = int(round(col))
+    height, width = heatmap.shape
+    if r < 0 or c < 0 or r >= height or c >= width:
+        return None
+    return int(heatmap[r, c])
+
+
+def _heat_array_stats(values):
+    if not values:
+        return None, None, None, 0
+    arr = np.asarray(values, dtype=np.float64)
+    return (
+        float(np.mean(arr)),
+        float(np.percentile(arr, 90)),
+        float(np.median(arr)),
+        int(arr.size),
+    )
+
+
+def _sample_line_heat(heatmap, geom, bbox_merc, pixel_size, max_samples=_LATERAL_HEAT_MAX_SAMPLES):
+    if heatmap is None or geom is None or bbox_merc is None:
+        return []
+    clipped = geom.intersection(_tile_box(bbox_merc))
+    if clipped is None or clipped.is_empty:
+        return []
+    values = []
+    for line in _as_lines(clipped):
+        length = line.length
+        if length <= 0:
+            continue
+        n = min(max_samples, max(2, int(math.ceil(length / max(pixel_size, 1.0))) + 1))
+        for i in range(n):
+            frac = 0.0 if n == 1 else i / (n - 1)
+            pt = line.interpolate(frac * length)
+            sample = _sample_heatmap_merc(heatmap, pt.x, pt.y, bbox_merc, pixel_size)
+            if sample is not None:
+                values.append(sample)
+            if len(values) >= max_samples:
+                return values
+    return values
+
+
+def _sample_axis_heat(heatmap, merc_xy, axis_vec, bbox_merc, pixel_size):
+    if heatmap is None or axis_vec is None or merc_xy.shape[0] < 2:
+        return []
+    vec = np.asarray(axis_vec, dtype=np.float64)
+    norm = float(np.linalg.norm(vec))
+    if norm < 1e-12:
+        return []
+    vec = vec / norm
+    centroid = merc_xy.mean(axis=0)
+    proj = (merc_xy - centroid) @ vec
+    t0 = float(np.min(proj))
+    t1 = float(np.max(proj))
+    span = t1 - t0
+    if span < max(pixel_size, 1.0):
+        sample = _sample_heatmap_merc(
+            heatmap, float(centroid[0]), float(centroid[1]), bbox_merc, pixel_size
+        )
+        return [] if sample is None else [sample]
+    n = min(_LATERAL_HEAT_MAX_SAMPLES, max(2, int(round(span / max(pixel_size, 1.0))) + 1))
+    values = []
+    for i in range(n):
+        t = t0 + span * i / (n - 1)
+        pt = centroid + vec * t
+        sample = _sample_heatmap_merc(heatmap, float(pt[0]), float(pt[1]), bbox_merc, pixel_size)
+        if sample is not None:
+            values.append(sample)
+    return values
+
+
+def _sample_segment_heat(heatmap, x0, y0, x1, y1, bbox_merc, pixel_size):
+    try:
+        line = LineString([(x0, y0), (x1, y1)])
+    except Exception:
+        return []
+    return _sample_line_heat(heatmap, line, bbox_merc, pixel_size, max_samples=24)
+
+
+def _cover_fractions(distances, n_samples, extra_wide=None):
+    out = {}
+    if n_samples <= 0:
+        for band in _LATERAL_COVER_BANDS_M:
+            out[f"parallel_osm_cover_frac_{int(band)}m"] = ""
+        out["parallel_osm_cover_frac_250m_30deg"] = ""
+        return out
+    dist = np.asarray(distances, dtype=np.float64)
+    for band in _LATERAL_COVER_BANDS_M:
+        out[f"parallel_osm_cover_frac_{int(band)}m"] = _fmt_float(
+            float(np.mean(dist <= band)), 4
+        )
+    if extra_wide is None:
+        out["parallel_osm_cover_frac_250m_30deg"] = ""
+    else:
+        wide = np.asarray(extra_wide, dtype=np.float64)
+        out["parallel_osm_cover_frac_250m_30deg"] = _fmt_float(
+            float(np.mean(wide <= _LATERAL_OSM_SEARCH_M)), 4
+        )
+    return out
+
+
+def component_lateral_osm_metrics(
+    merc_xy,
+    axis_vec,
+    lookup,
+    heatmap,
+    bbox_merc,
+    pixel_size,
+    candidate_heat_mean,
+    candidate_heat_p90,
+):
+    """Diagnostic-only: nearby parallel OSM vs heatmap intensity. Not used for suppression."""
+    empty = _empty_lateral_metrics()
+    if lookup is None or merc_xy.size == 0 or bbox_merc is None:
+        return empty
+
+    axis_vals = _sample_axis_heat(heatmap, merc_xy, axis_vec, bbox_merc, pixel_size)
+    axis_mean, axis_p90, _axis_med, axis_n = _heat_array_stats(axis_vals)
+    if axis_n:
+        empty["candidate_axis_heat_mean"] = _fmt_float(axis_mean, 4)
+        empty["candidate_axis_heat_p90"] = _fmt_float(axis_p90, 4)
+        empty["candidate_axis_heat_n"] = _fmt_int(axis_n)
+
+    minx, miny = merc_xy.min(axis=0)
+    maxx, maxy = merc_xy.max(axis=0)
+    nearby = lookup.items_geoms_near_envelope(
+        float(minx), float(miny), float(maxx), float(maxy), padding=_LATERAL_OSM_SEARCH_M
+    )
+    samples = _sample_component_xy(merc_xy, axis_vec)
+    n_samples = samples.shape[0]
+    if n_samples == 0:
+        return empty
+    if not nearby:
+        zeroed = _empty_lateral_metrics(zero_cover=True)
+        zeroed["candidate_axis_heat_mean"] = empty["candidate_axis_heat_mean"]
+        zeroed["candidate_axis_heat_p90"] = empty["candidate_axis_heat_p90"]
+        zeroed["candidate_axis_heat_n"] = empty["candidate_axis_heat_n"]
+        return zeroed
+
+    local_items = [pair[0] for pair in nearby]
+    local_geoms = [pair[1] for pair in nearby]
+    local_tree = STRtree(local_geoms)
+
+    dist_15 = np.full(n_samples, np.inf, dtype=np.float64)
+    dist_30 = np.full(n_samples, np.inf, dtype=np.float64)
+    votes = {}
+
+    for i, xy in enumerate(samples):
+        point = Point(float(xy[0]), float(xy[1]))
+        env = shapely_box(
+            point.x - _LATERAL_OSM_SEARCH_M,
+            point.y - _LATERAL_OSM_SEARCH_M,
+            point.x + _LATERAL_OSM_SEARCH_M,
+            point.y + _LATERAL_OSM_SEARCH_M,
+        )
+        indices = local_tree.query(env)
+        idxs = np.asarray(indices).reshape(-1)
+        ranked = []
+        for raw_idx in idxs:
+            idx = int(raw_idx)
+            geom = local_geoms[idx]
+            dist = float(geom.distance(point))
+            if dist <= _LATERAL_OSM_SEARCH_M:
+                ranked.append((dist, idx))
+        ranked.sort(key=lambda item: item[0])
+        ranked = ranked[:_LATERAL_MAX_GEOMS_PER_SAMPLE]
+        local_vec = _local_component_direction(merc_xy, xy, axis_vec)
+        best15 = None
+        best30 = None
+        for dist, idx in ranked:
+            geom = local_geoms[idx]
+            tangent = local_tangent(geom, point)
+            if tangent is None or local_vec is None:
+                continue
+            angle = _orientation_diff_deg(
+                local_vec[0], local_vec[1], tangent[0], tangent[1]
+            )
+            if angle is None:
+                continue
+            if angle <= _LATERAL_PARALLEL_WIDE_DEG and (best30 is None or dist < best30[0]):
+                best30 = (dist, angle, idx)
+            if angle <= _LATERAL_PARALLEL_DEG and (best15 is None or dist < best15[0]):
+                best15 = (dist, angle, idx)
+        if best30 is not None:
+            dist_30[i] = best30[0]
+        if best15 is not None:
+            dist_15[i] = best15[0]
+            idx = best15[2]
+            item = local_items[idx]
+            key = (item.source, item.osm_id)
+            rec = votes.setdefault(
+                key,
+                {
+                    "item": item,
+                    "geom": local_geoms[idx],
+                    "dists": [],
+                    "angles": [],
+                    "count": 0,
+                },
+            )
+            rec["dists"].append(best15[0])
+            rec["angles"].append(best15[1])
+            rec["count"] += 1
+
+    cover = _cover_fractions(dist_15, n_samples, extra_wide=dist_30)
+    out = _empty_lateral_metrics()
+    out.update(cover)
+    out["candidate_axis_heat_mean"] = empty["candidate_axis_heat_mean"]
+    out["candidate_axis_heat_p90"] = empty["candidate_axis_heat_p90"]
+    out["candidate_axis_heat_n"] = empty["candidate_axis_heat_n"]
+
+    if not votes:
+        return out
+
+    winner = max(
+        votes.values(),
+        key=lambda rec: (rec["count"], -float(np.median(rec["dists"]))),
+    )
+    item = winner["item"]
+    tags = _item_tags(item)
+    out["nearest_parallel_osm_distance_m"] = _fmt_float(float(np.median(winner["dists"])), 3)
+    out["nearest_parallel_osm_min_m"] = _fmt_float(float(np.min(winner["dists"])), 3)
+    out["nearest_parallel_osm_angle_deg"] = _fmt_float(float(np.median(winner["angles"])), 2)
+    out["nearest_parallel_osm_id"] = str(item.osm_id)
+    out["nearest_parallel_osm_highway"] = tags.get("highway", "") or tags.get("route", "")
+    out["nearest_parallel_osm_name"] = tags.get("name", "")
+
+    osm_vals = _sample_line_heat(heatmap, winner["geom"], bbox_merc, pixel_size)
+    osm_mean, osm_p90, _osm_med, osm_n = _heat_array_stats(osm_vals)
+    if osm_n:
+        out["parallel_osm_heat_mean"] = _fmt_float(osm_mean, 4)
+        out["parallel_osm_heat_p90"] = _fmt_float(osm_p90, 4)
+        out["parallel_osm_heat_n"] = _fmt_int(osm_n)
+
+    cand_mean = candidate_heat_mean
+    cand_p90 = candidate_heat_p90
+    if cand_mean is None or cand_mean <= 0:
+        cand_mean = axis_mean
+    if cand_p90 is None or cand_p90 <= 0:
+        cand_p90 = axis_p90
+    if osm_n and cand_mean and cand_mean > 0:
+        out["parallel_osm_heat_ratio_mean"] = _fmt_float(osm_mean / cand_mean, 4)
+    if osm_n and cand_p90 and cand_p90 > 0:
+        out["parallel_osm_heat_ratio_p90"] = _fmt_float(osm_p90 / cand_p90, 4)
+
+    centroid = merc_xy.mean(axis=0)
+    centroid_pt = Point(float(centroid[0]), float(centroid[1]))
+    nearest_on_way = None
+    best_line_dist = None
+    between_vals = []
+    for line in _as_lines(winner["geom"]):
+        if line.length <= 0:
+            continue
+        dist = line.distance(centroid_pt)
+        if best_line_dist is None or dist < best_line_dist:
+            best_line_dist = dist
+            nearest_on_way = line.interpolate(line.project(centroid_pt))
+    if nearest_on_way is not None:
+        between_vals = _sample_segment_heat(
+            heatmap,
+            float(centroid[0]),
+            float(centroid[1]),
+            float(nearest_on_way.x),
+            float(nearest_on_way.y),
+            bbox_merc,
+            pixel_size,
+        )
+    _bmean, _bp90, between_med, between_n = _heat_array_stats(between_vals)
+    if between_n:
+        out["between_heat_median"] = _fmt_float(between_med, 4)
+        cand_med = cand_mean
+        if candidate_heat_mean is not None and candidate_heat_mean > 0:
+            cand_med = candidate_heat_mean
+        elif axis_mean is not None and axis_mean > 0:
+            cand_med = axis_mean
+        if cand_med and cand_med > 0:
+            out["between_heat_ratio"] = _fmt_float(between_med / cand_med, 4)
+        if osm_n and cand_p90 and cand_p90 > 0:
+            # min(OSM corridor, in-between) / candidate: high when the candidate
+            # sits in a hot lateral halo rather than an independent corridor.
+            halo_num = min(osm_p90, between_med)
+            out["heat_halo_score"] = _fmt_float(halo_num / cand_p90, 4)
+    return out
+
 
 def _osm_fields(item, distance_m):
     if item is None:
@@ -596,6 +969,7 @@ def build_diagnostic_row(
     accepted,
     written_to_geojson,
     bbox_merc=None,
+    heatmap_unmasked=None,
     suppressed_parallel_osm=False,
     suppressed_ferry=False,
     inside_area=True,
@@ -662,6 +1036,30 @@ def build_diagnostic_row(
     row["component_orientation_deg"] = _fmt_float(angle, 2) if angle is not None else ""
     row["component_elongation"] = _fmt_float(elong, 3) if elong is not None else ""
     row.update(follow)
+
+    if n_pixels and bbox_merc is not None:
+        merc_xy = pixels_to_mercator(rows, cols, bbox_merc, pixel_size_m)
+        _pca_angle, _pca_elong, axis_vec = component_pca(merc_xy)
+        cand_mean = float(np.mean(values)) if values.size else None
+        cand_p90 = float(np.percentile(values, 90)) if values.size else None
+        heat_for_corridor = heatmap_unmasked if heatmap_unmasked is not None else heatmap_snapshot
+        try:
+            row.update(
+                component_lateral_osm_metrics(
+                    merc_xy,
+                    axis_vec,
+                    lookup,
+                    heat_for_corridor,
+                    bbox_merc,
+                    pixel_size_m,
+                    cand_mean,
+                    cand_p90,
+                )
+            )
+        except Exception:
+            row.update(_empty_lateral_metrics())
+    else:
+        row.update(_empty_lateral_metrics())
 
     row["raw_candidate"] = _bool_csv(True)
     row["too_small"] = _bool_csv(too_small)

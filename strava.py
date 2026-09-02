@@ -1451,6 +1451,10 @@ def check_strava_tile(polygon_area, x, y, zoom):
             )
             osm_items = parse_osm_root(osm_root).items
 
+        # Keep the raw Strava tile for diagnostic corridor sampling. Detection
+        # continues to use the OSM-masked image below; this does not change
+        # masking, thresholds, or candidate IDs.
+        heatmap_unmasked = np.array(image) if diagnostic_writer is not None else None
         plot_osm_items(osm_items, draw, width, pixel_size)
 
         if debug:
@@ -1609,6 +1613,7 @@ def check_strava_tile(polygon_area, x, y, zoom):
                         center_lat=result[1],
                         pixel_size_m=pixel_size,
                         heatmap_snapshot=heatmap_snapshot,
+                        heatmap_unmasked=heatmap_unmasked,
                         threshold=threshold,
                         lookup=tile_lookup,
                         lon2x=lon2x,

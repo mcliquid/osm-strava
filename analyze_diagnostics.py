@@ -35,6 +35,59 @@ TAGS = "nearest_osm_tags"
 STATUS_FIXED = "Fixed"
 STATUS_NAI = "Not_An_Issue"
 STATUS_TOO_HARD = "Too_Hard"
+STATUS_ALREADY_FIXED = "Already_Fixed"
+STATUS_FOCUS = (STATUS_NAI, STATUS_FIXED, STATUS_ALREADY_FIXED, STATUS_TOO_HARD)
+
+LATERAL_DIST = "nearest_parallel_osm_distance_m"
+LATERAL_MIN = "nearest_parallel_osm_min_m"
+LATERAL_ANGLE = "nearest_parallel_osm_angle_deg"
+LATERAL_COVER150 = "parallel_osm_cover_frac_150m"
+LATERAL_COVER200 = "parallel_osm_cover_frac_200m"
+LATERAL_COVER250 = "parallel_osm_cover_frac_250m"
+LATERAL_COVER250_30 = "parallel_osm_cover_frac_250m_30deg"
+LATERAL_RATIO_MEAN = "parallel_osm_heat_ratio_mean"
+LATERAL_RATIO_P90 = "parallel_osm_heat_ratio_p90"
+LATERAL_OSM_HEAT_P90 = "parallel_osm_heat_p90"
+LATERAL_BETWEEN = "between_heat_ratio"
+LATERAL_HALO = "heat_halo_score"
+LATERAL_OSM_ID = "nearest_parallel_osm_id"
+
+LATERAL_METRIC_FIELDS = [
+    LATERAL_DIST,
+    LATERAL_MIN,
+    LATERAL_ANGLE,
+    "parallel_osm_cover_frac_50m",
+    "parallel_osm_cover_frac_75m",
+    "parallel_osm_cover_frac_100m",
+    LATERAL_COVER150,
+    LATERAL_COVER200,
+    LATERAL_COVER250,
+    LATERAL_COVER250_30,
+    "candidate_axis_heat_mean",
+    "candidate_axis_heat_p90",
+    "strava_mean",
+    "strava_p90",
+    LATERAL_OSM_HEAT_P90,
+    LATERAL_RATIO_MEAN,
+    LATERAL_RATIO_P90,
+    LATERAL_BETWEEN,
+    LATERAL_HALO,
+]
+
+LATERAL_RULE_COLUMNS = [
+    "rule_name",
+    "universe",
+    "n_universe",
+    "removed_not_an_issue",
+    "retained_not_an_issue",
+    "removed_fixed",
+    "retained_fixed",
+    "removed_already_fixed",
+    "retained_already_fixed",
+    "removed_too_hard",
+    "retained_too_hard",
+    "removed_fixed_ids",
+]
 
 # Current best measured suppression rule (analysis-only visual export).
 VISUAL_FOLLOW100_MIN = 0.70
@@ -1959,6 +2012,362 @@ def run_remaining_v2_analysis(remaining, accepted, diagnostics, args):
     return unique_results
 
 
+def has_lateral_columns(rows):
+    return bool(rows) and LATERAL_RATIO_P90 in rows[0]
+
+
+def existing_parallel_rule(row):
+    return meets_visual_rule(row)
+
+
+def evaluate_status_rule(name, pred, rows, universe_name):
+    totals = Counter(row.get("_mr_status") for row in rows)
+    removed = [row for row in rows if pred(row)]
+    removed_status = Counter(row.get("_mr_status") for row in removed)
+    def pair(status):
+        rem = removed_status.get(status, 0)
+        tot = totals.get(status, 0)
+        return rem, tot - rem
+    nai_r, nai_k = pair(STATUS_NAI)
+    fix_r, fix_k = pair(STATUS_FIXED)
+    af_r, af_k = pair(STATUS_ALREADY_FIXED)
+    th_r, th_k = pair(STATUS_TOO_HARD)
+    return {
+        "rule_name": name,
+        "universe": universe_name,
+        "n_universe": len(rows),
+        "removed_not_an_issue": nai_r,
+        "retained_not_an_issue": nai_k,
+        "removed_fixed": fix_r,
+        "retained_fixed": fix_k,
+        "removed_already_fixed": af_r,
+        "retained_already_fixed": af_k,
+        "removed_too_hard": th_r,
+        "retained_too_hard": th_k,
+        "removed_fixed_ids": ";".join(
+            row["candidate_id"] for row in removed if row.get("_mr_status") == STATUS_FIXED
+        ),
+        "_removed_ids": [row["candidate_id"] for row in removed],
+    }
+
+
+def print_status_rule_table(results, limit=None):
+    header = (
+        f"{'rule_name':<78} {'NAI-':>5} {'NAI+':>5} {'Fix-':>5} {'Fix+':>5} "
+        f"{'AF-':>4} {'AF+':>4} {'TH-':>4} {'TH+':>4}"
+    )
+    print(header)
+    print("-" * len(header))
+    shown = results if limit is None else results[:limit]
+    for row in shown:
+        print(
+            f"{row['rule_name']:<78} "
+            f"{row['removed_not_an_issue']:>5} "
+            f"{row['retained_not_an_issue']:>5} "
+            f"{row['removed_fixed']:>5} "
+            f"{row['retained_fixed']:>5} "
+            f"{row['removed_already_fixed']:>4} "
+            f"{row['retained_already_fixed']:>4} "
+            f"{row['removed_too_hard']:>4} "
+            f"{row['retained_too_hard']:>4}"
+        )
+    if limit is not None and len(results) > limit:
+        print(f"... {len(results) - limit} more rules in lateral-rule-results.csv")
+
+
+def print_metric_distributions(rows_by_status, fields):
+    header = (
+        f"{'metric':<34} {'status':<16} {'n':>5} {'min':>8} {'p25':>8} "
+        f"{'median':>8} {'mean':>8} {'p75':>8} {'max':>8}"
+    )
+    print(header)
+    print("-" * len(header))
+    for field in fields:
+        for status, rows in rows_by_status:
+            stats = describe_values([parse_float(row.get(field)) for row in rows])
+            print(
+                f"{field:<34} {status:<16} {stats['n']:>5} "
+                f"{str(stats['min']):>8} {str(stats['p25']):>8} "
+                f"{str(stats['median']):>8} {str(stats['mean']):>8} "
+                f"{str(stats['p75']):>8} {str(stats['max']):>8}"
+            )
+
+
+def build_lateral_rules():
+    rules = [
+        (
+            "EXISTING follow100>=0.70 AND parallel15>=0.70",
+            existing_parallel_rule,
+        )
+    ]
+    for ratio in (1.25, 1.5, 2.0, 2.5, 3.0, 4.0):
+        rules.append(
+            (
+                f"heat_ratio_p90 >= {ratio:g}",
+                ge(LATERAL_RATIO_P90, ratio),
+            )
+        )
+    for cover, field, label in (
+        (0.50, LATERAL_COVER250, "cover250"),
+        (0.70, LATERAL_COVER250, "cover250"),
+        (0.80, LATERAL_COVER250, "cover250"),
+        (0.90, LATERAL_COVER250, "cover250"),
+        (0.70, LATERAL_COVER150, "cover150"),
+        (0.80, LATERAL_COVER200, "cover200"),
+        (0.70, LATERAL_COVER250_30, "cover250@30deg"),
+    ):
+        rules.append((f"{label} >= {cover:g}", ge(field, cover)))
+    for halo in (1.0, 1.5, 2.0):
+        rules.append((f"halo_score >= {halo:g}", ge(LATERAL_HALO, halo)))
+    for between in (0.8, 1.0, 1.2):
+        rules.append((f"between_heat_ratio >= {between:g}", ge(LATERAL_BETWEEN, between)))
+    for dist in (50, 75, 100):
+        rules.append(
+            (
+                f"parallel_osm_min >= {dist} (outside local mask)",
+                ge(LATERAL_MIN, dist),
+            )
+        )
+
+    combos = []
+    for ratio in (1.5, 2.0, 2.5, 3.0):
+        for cover in (0.50, 0.70, 0.80):
+            combos.append(
+                (
+                    f"heat_ratio_p90>={ratio:g} AND cover250>={cover:g}",
+                    all_of(ge(LATERAL_RATIO_P90, ratio), ge(LATERAL_COVER250, cover)),
+                )
+            )
+            combos.append(
+                (
+                    f"heat_ratio_p90>={ratio:g} AND cover250>={cover:g} AND min>=50",
+                    all_of(
+                        ge(LATERAL_RATIO_P90, ratio),
+                        ge(LATERAL_COVER250, cover),
+                        ge(LATERAL_MIN, 50),
+                    ),
+                )
+            )
+            combos.append(
+                (
+                    f"heat_ratio_p90>={ratio:g} AND cover250>={cover:g} AND halo>=1.0",
+                    all_of(
+                        ge(LATERAL_RATIO_P90, ratio),
+                        ge(LATERAL_COVER250, cover),
+                        ge(LATERAL_HALO, 1.0),
+                    ),
+                )
+            )
+    rules.extend(combos)
+
+    incremental = []
+    for name, pred in list(combos):
+        incremental.append(
+            (
+                f"{name} AND NOT existing parallel",
+                lambda row, p=pred: p(row) and not existing_parallel_rule(row),
+            )
+        )
+    rules.extend(incremental)
+    return rules
+
+
+def print_control_metric_rows(title, rows):
+    print()
+    print(title)
+    if not rows:
+        print("  (none)")
+        return
+    header = (
+        f"{'candidate_id':<28} {'status':<12} {'ratio':>7} {'halo':>6} "
+        f"{'between':>8} {'min_m':>7} {'dist':>7} {'c250':>6} "
+        f"{'f100':>6} {'p15':>6}"
+    )
+    print(header)
+    print("-" * len(header))
+    for row in rows:
+        print(
+            f"{row.get('candidate_id', ''):<28} "
+            f"{(row.get('_mr_status') or ''):<12} "
+            f"{(row.get(LATERAL_RATIO_P90) or ''):>7} "
+            f"{(row.get(LATERAL_HALO) or ''):>6} "
+            f"{(row.get(LATERAL_BETWEEN) or ''):>8} "
+            f"{(row.get(LATERAL_MIN) or ''):>7} "
+            f"{(row.get(LATERAL_DIST) or ''):>7} "
+            f"{(row.get(LATERAL_COVER250) or ''):>6} "
+            f"{(row.get(FOLLOW100) or ''):>6} "
+            f"{(row.get(PARALLEL15) or ''):>6}"
+        )
+
+
+def run_lateral_heatmap_analysis(accepted, diagnostics, mr_by_name, args):
+    print_section("Lateral scatter / parallel-OSM heatmap (diagnostic only)")
+    print(
+        "New metrics search for a stronger mapped-road heatmap corridor beside "
+        "the candidate (up to 250 m, roughly parallel). No production rule was applied."
+    )
+    print("Already_Fixed is reported but not treated as a false positive.")
+    print()
+
+    diag_ids = {row.get("candidate_id") for row in diagnostics if row.get("candidate_id")}
+    mr_ids = set(mr_by_name)
+    joined_ids = mr_ids & diag_ids
+    missing_ids = sorted(mr_ids - diag_ids)
+    joined_all = [row for row in diagnostics if row.get("candidate_id") in mr_by_name]
+    for row in joined_all:
+        mr = mr_by_name.get(row["candidate_id"])
+        row["_mr_status"] = normalize_status(mr.get("TaskStatus") if mr else "") or row.get("_mr_status", "")
+
+    print_kv("Diagnostics rows", len(diagnostics))
+    print_kv("MapRoulette tasks", len(mr_by_name))
+    print_kv("Joined (candidate_id == TaskName)", f"{len(joined_ids)}/{len(mr_ids)}")
+    if len(joined_ids) == len(mr_ids) and mr_ids:
+        print_kv("Join complete", "yes")
+    else:
+        print_kv("Join complete", "no")
+
+    missing_by_status = Counter(
+        normalize_status(mr_by_name[name].get("TaskStatus")) for name in missing_ids
+    )
+    joined_status = Counter(row.get("_mr_status") for row in joined_all)
+    print()
+    print("Join coverage by MapRoulette status:")
+    for status in list(STATUS_FOCUS) + sorted(set(list(joined_status) + list(missing_by_status)) - set(STATUS_FOCUS)):
+        joined_n = joined_status.get(status, 0)
+        missing_n = missing_by_status.get(status, 0)
+        total = joined_n + missing_n
+        print_kv(status or "(empty)", f"{joined_n}/{total} joined, {missing_n} missing")
+    if missing_ids:
+        print()
+        print("Missing TaskNames (not in current diagnostics):")
+        for name in missing_ids:
+            print(f"  {name}  {normalize_status(mr_by_name[name].get('TaskStatus'))}")
+
+    nai = [row for row in joined_all if row.get("_mr_status") == STATUS_NAI]
+    fixed = [row for row in joined_all if row.get("_mr_status") == STATUS_FIXED]
+    too_hard = [row for row in joined_all if row.get("_mr_status") == STATUS_TOO_HARD]
+    already = [row for row in joined_all if row.get("_mr_status") == STATUS_ALREADY_FIXED]
+    labeled = nai + fixed + too_hard + already
+    survived_existing = [row for row in nai if not existing_parallel_rule(row)]
+    written_nai = [row for row in nai if parse_bool(row.get("written_to_geojson"))]
+
+    print()
+    print_kv("Joined Not_An_Issue", len(nai))
+    print_kv("Joined Fixed", len(fixed))
+    print_kv("Joined Too_Hard", len(too_hard))
+    print_kv("Joined Already_Fixed", f"{len(already)} (stale OSM; not false positives)")
+    print_kv("NAI surviving existing parallel rule", f"{len(survived_existing)}/{len(nai)}")
+    print_kv("NAI written_to_geojson", f"{len(written_nai)}/{len(nai)}")
+
+    print_control_metric_rows("Fixed candidates in current diagnostics", fixed)
+    print_control_metric_rows("Too_Hard candidates in current diagnostics", too_hard)
+
+    print_section("Not_An_Issue distributions (joined 47)")
+    print_metric_distributions(
+        [("Not_An_Issue", nai)],
+        [
+            LATERAL_BETWEEN,
+            LATERAL_HALO,
+            LATERAL_RATIO_P90,
+            LATERAL_DIST,
+            LATERAL_MIN,
+            "parallel_osm_cover_frac_50m",
+            "parallel_osm_cover_frac_75m",
+            "parallel_osm_cover_frac_100m",
+            LATERAL_COVER150,
+            LATERAL_COVER200,
+            LATERAL_COVER250,
+            LATERAL_COVER250_30,
+        ],
+    )
+
+    print_section(
+        "False positives that survived current production suppression "
+        "(follow100>=0.70 AND parallel15>=0.70)"
+    )
+    print(
+        f"{len(survived_existing)} of {len(nai)} joined Not_An_Issue do not match the "
+        "existing parallel rule. Those are the candidates a new rule must solve."
+    )
+    if survived_existing:
+        print_metric_distributions(
+            [("NAI survived existing parallel", survived_existing)],
+            [
+                LATERAL_BETWEEN,
+                LATERAL_HALO,
+                LATERAL_RATIO_P90,
+                LATERAL_DIST,
+                LATERAL_MIN,
+                LATERAL_COVER250,
+            ],
+        )
+
+    universes = [
+        ("joined_mr_tasks", labeled),
+        ("nai_survived_existing_parallel", survived_existing),
+    ]
+
+    all_results = []
+    lateral_rules = build_lateral_rules()
+    for universe_name, rows in universes:
+        if not rows:
+            continue
+        results = [
+            evaluate_status_rule(name, pred, rows, universe_name)
+            for name, pred in lateral_rules
+        ]
+        all_results.extend(results)
+        print_section(f"Candidate rules on {universe_name} (n={len(rows)})")
+        print(
+            "NAI-/Fix-/TH- = removed; NAI+/Fix+/TH+ = retained. "
+            "Already_Fixed is ignored as a false-positive signal. "
+            "Analysis only; no production change."
+        )
+        print()
+        ranked = [row for row in results if row["removed_not_an_issue"] > 0]
+        ranked.sort(
+            key=lambda row: (
+                row["removed_fixed"],
+                -row["removed_not_an_issue"],
+                row["removed_too_hard"],
+                row["rule_name"],
+            )
+        )
+        print("Ranked by Fixed removed (0 first), then NAI removed:")
+        print_status_rule_table(ranked, limit=20)
+
+        safest = [
+            row for row in ranked
+            if row["removed_fixed"] == 0 and row["removed_too_hard"] == 0
+        ]
+        print()
+        print("Recommended-if-any (0 Fixed and 0 Too_Hard removed; Already_Fixed ignored):")
+        if safest:
+            print_status_rule_table(safest, limit=12)
+        else:
+            print("  (none)")
+        unsafe = [row for row in ranked if row["removed_fixed"] > 0]
+        if unsafe:
+            print()
+            print("UNSAFE (would remove the current Fixed control):")
+            print_status_rule_table(unsafe, limit=10)
+
+        print()
+        print("Fixed IDs removed by ranked rules:")
+        shown = False
+        for row in ranked:
+            if row["removed_fixed_ids"]:
+                shown = True
+                print(f"  {row['rule_name']}: {row['removed_fixed_ids']}")
+        if not shown:
+            print("  (none in this snapshot)")
+
+    write_csv(args.lateral_rules, all_results, LATERAL_RULE_COLUMNS)
+    print()
+    print_kv("lateral-rule-results.csv", args.lateral_rules)
+    return all_results
+
+
 def main(argv=None):
     if hasattr(sys.stdout, "reconfigure"):
         try:
@@ -1972,6 +2381,11 @@ def main(argv=None):
     parser.add_argument("maproulette_csv")
     parser.add_argument("--rule-results", default="rule-results.csv")
     parser.add_argument("--joined", default="joined-accepted.csv")
+    parser.add_argument(
+        "--lateral-rules",
+        default="lateral-rule-results.csv",
+        help="CSV of diagnostic-only lateral-heatmap rule evaluations",
+    )
     parser.add_argument(
         "--geojson",
         metavar="SOURCE_GEOJSON",
@@ -2067,6 +2481,7 @@ def main(argv=None):
     print_kv("Accepted matched to MR", len(matched))
     print_kv("Matched Fixed", fixed_total)
     print_kv("Matched Not_An_Issue", nai_total)
+    print_kv("Matched Already_Fixed", matched_status.get(STATUS_ALREADY_FIXED, 0))
     print_kv("Matched Too_Hard", too_hard_total)
     print_kv("Accepted with no MR label", len(unlabeled))
     print_kv("MR Fixed absent from diagnostics CSV", len(missing_fixed))
@@ -2088,7 +2503,16 @@ def main(argv=None):
             print(f"  {task_id}")
 
     has_written_col = bool(diagnostics) and "written_to_geojson" in diagnostics[0]
+    if has_lateral_columns(diagnostics):
+        run_lateral_heatmap_analysis(accepted, diagnostics, mr_by_name, args)
     if has_written_col:
+        remaining = [
+            row for row in accepted if parse_bool(row.get("written_to_geojson"))
+        ]
+        run_remaining_v2_analysis(remaining, accepted, diagnostics, args)
+        print_section("Recommendation (measured data only)")
+        print("No production rule was changed by this analysis.")
+        return 0
         remaining = [
             row for row in accepted if parse_bool(row.get("written_to_geojson"))
         ]
