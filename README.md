@@ -219,8 +219,12 @@ osmium extract --strategy=complete_ways --polygon boundaries/<region>.geojson
 ```
 
 `complete_ways` keeps every node referenced by a way that intersects the
-area, so the detector XML is referentially complete at the boundary. The old
-`osmupdate -B` clip left tens of thousands of missing node references.
+area, so the detector XML is referentially complete at the boundary. Ferry
+routes and other long ways that touch the polygon may extend the *data*
+bounding box well beyond the island or district. The configured safety
+window therefore applies to the requested GeoJSON boundary, not to every
+complete-way node. The old `osmupdate -B` clip left tens of thousands of
+missing node references.
 
 Geofabrik extracts are typically about a day behind OSM, not minutely like
 Planet replication or Overpass.
@@ -264,7 +268,9 @@ The updater:
    that source plus the current boundary
 4. otherwise downloads to a temp file, validates, then extracts and converts
 5. runs `osmium check-refs` on the extract (fails on missing way→node refs)
-6. replaces `current.osm.pbf` / `current.osm` only after validation
+6. checks that the GeoJSON boundary lies in the region safety window and
+   that the extract overlaps that boundary
+7. replaces `current.osm.pbf` / `current.osm` only after validation
 
 Use the generated XML with `strava.py`:
 

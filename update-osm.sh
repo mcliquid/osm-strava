@@ -338,7 +338,7 @@ print_region_config() {
   echo "Extract PBF:       $(relpath "$EXTRACT_PBF")"
   echo "Extract XML:       $(relpath "$EXTRACT_XML")"
   echo "Extract strategy:  ${EXTRACT_STRATEGY}"
-  echo "Safety bbox:       lon ${BBOX_LON_MIN}..${BBOX_LON_MAX}, lat ${BBOX_LAT_MIN}..${BBOX_LAT_MAX}"
+  echo "Safety bbox:       lon ${BBOX_LON_MIN}..${BBOX_LON_MAX}, lat ${BBOX_LAT_MIN}..${BBOX_LAT_MAX} (requested boundary, not complete_ways nodes)"
   echo "Source size range: $(format_mib "$SOURCE_MIN_BYTES") .. $(format_mib "$SOURCE_MAX_BYTES")"
   echo "Min objects:       nodes>=$(format_int "$MIN_NODES") ways>=$(format_int "$MIN_WAYS") relations>=$(format_int "$MIN_RELS")"
 }
@@ -392,6 +392,17 @@ else:
     emit("INFO_MIN_LAT", "")
     emit("INFO_MAX_LON", "")
     emit("INFO_MAX_LAT", "")
+boxes = data.get("header", {}).get("boxes") or []
+if boxes and isinstance(boxes[0], list) and len(boxes[0]) == 4:
+    emit("INFO_HDR_MIN_LON", boxes[0][0])
+    emit("INFO_HDR_MIN_LAT", boxes[0][1])
+    emit("INFO_HDR_MAX_LON", boxes[0][2])
+    emit("INFO_HDR_MAX_LAT", boxes[0][3])
+else:
+    emit("INFO_HDR_MIN_LON", "")
+    emit("INFO_HDR_MIN_LAT", "")
+    emit("INFO_HDR_MAX_LON", "")
+    emit("INFO_HDR_MAX_LAT", "")
 emit("INFO_NODES", int(count.get("nodes") or 0))
 emit("INFO_WAYS", int(count.get("ways") or 0))
 emit("INFO_RELS", int(count.get("relations") or 0))
@@ -414,7 +425,7 @@ load_osm_info() {
   fi
 }
 
-validate_bbox() {
+validate_bbox_inside_window() {
   python3 -c '
 import sys
 min_lon, min_lat, max_lon, max_lat = map(float, sys.argv[1:5])
@@ -429,6 +440,94 @@ ok = (
 )
 sys.exit(0 if ok else 1)
 ' "$1" "$2" "$3" "$4" "$BBOX_LON_MIN" "$BBOX_LON_MAX" "$BBOX_LAT_MIN" "$BBOX_LAT_MAX"
+}
+
+bboxes_overlap() {
+  python3 -c '
+import sys
+a_minx, a_miny, a_maxx, a_maxy = map(float, sys.argv[1:5])
+b_minx, b_miny, b_maxx, b_maxy = map(float, sys.argv[5:9])
+overlap = not (
+    a_maxx < b_minx or b_maxx < a_minx or a_maxy < b_miny or b_maxy < a_miny
+)
+sys.exit(0 if overlap else 1)
+' "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8"
+}
+
+load_boundary_bbox() {
+  local parsed
+  parsed="$(
+    python3 - "$BOUNDARY" <<'PY'
+import json, sys
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as handle:
+    payload = json.load(handle)
+features = []
+ptype = payload.get("type")
+if ptype == "FeatureCollection":
+    features = payload.get("features") or []
+elif ptype == "Feature":
+    features = [payload]
+else:
+    features = [{"geometry": payload}]
+
+minx = miny = 1e9
+maxx = maxy = -1e9
+ncoords = 0
+
+def walk(obj):
+    global minx, miny, maxx, maxy, ncoords
+    if not isinstance(obj, list) or not obj:
+        return
+    if isinstance(obj[0], (int, float)) and len(obj) >= 2 and not isinstance(obj[0], list):
+        lon, lat = float(obj[0]), float(obj[1])
+        ncoords += 1
+        minx = min(minx, lon)
+        maxx = max(maxx, lon)
+        miny = min(miny, lat)
+        maxy = max(maxy, lat)
+        return
+    for item in obj:
+        walk(item)
+
+for feature in features:
+    geometry = feature.get("geometry") if isinstance(feature, dict) else None
+    if not geometry:
+        continue
+    if geometry.get("type") not in ("Polygon", "MultiPolygon"):
+        continue
+    walk(geometry.get("coordinates"))
+
+if ncoords == 0:
+    sys.stderr.write(f"No polygon/multipolygon coordinates in {path}\n")
+    sys.exit(2)
+print(f"BOUNDARY_MIN_LON={minx}")
+print(f"BOUNDARY_MIN_LAT={miny}")
+print(f"BOUNDARY_MAX_LON={maxx}")
+print(f"BOUNDARY_MAX_LAT={maxy}")
+PY
+  )" || fail "Could not read polygon bbox from $(relpath "$BOUNDARY")"
+  eval "$parsed"
+  echo "Boundary bbox:       (${BOUNDARY_MIN_LON}, ${BOUNDARY_MIN_LAT}, ${BOUNDARY_MAX_LON}, ${BOUNDARY_MAX_LAT})"
+  if ! validate_bbox_inside_window "$BOUNDARY_MIN_LON" "$BOUNDARY_MIN_LAT" "$BOUNDARY_MAX_LON" "$BOUNDARY_MAX_LAT"; then
+    fail "Requested boundary is outside the safety window (lon ${BBOX_LON_MIN}..${BBOX_LON_MAX}, lat ${BBOX_LAT_MIN}..${BBOX_LAT_MAX}): (${BOUNDARY_MIN_LON}, ${BOUNDARY_MIN_LAT}, ${BOUNDARY_MAX_LON}, ${BOUNDARY_MAX_LAT})"
+  fi
+}
+
+validate_data_overlaps_boundary() {
+  local label="$1"
+  local min_lon="$2"
+  local min_lat="$3"
+  local max_lon="$4"
+  local max_lat="$5"
+  if [[ -z "$min_lon" ]]; then
+    fail "${label} has no data bounding box"
+  fi
+  if ! bboxes_overlap "$min_lon" "$min_lat" "$max_lon" "$max_lat" \
+      "$BOUNDARY_MIN_LON" "$BOUNDARY_MIN_LAT" "$BOUNDARY_MAX_LON" "$BOUNDARY_MAX_LAT"; then
+    fail "${label} data bounding box does not overlap the requested boundary (${BOUNDARY_MIN_LON}, ${BOUNDARY_MIN_LAT}, ${BOUNDARY_MAX_LON}, ${BOUNDARY_MAX_LAT}): (${min_lon}, ${min_lat}, ${max_lon}, ${max_lat})"
+  fi
 }
 
 read_source_meta() {
@@ -532,7 +631,7 @@ validate_source_pbf() {
 download_source() {
   echo "Downloading ${GEOFABRIK_URL}"
   mkdir -p "$(dirname "$SOURCE_PBF")"
-  rm -f "$SOURCE_TMP"
+  rm -f "$SOURCE_TMP" "$SOURCE_TMP_LEGACY"
   if ! curl -fL --retry 3 --retry-delay 2 --max-time 3600 \
       -A "osm-strava-update/1.0" \
       -o "$SOURCE_TMP" "$GEOFABRIK_URL"; then
@@ -757,10 +856,14 @@ load_region "$REGION_ID"
 SOURCE_META="${SOURCE_PBF}.http"
 STAMP_FILE="$(dirname "$EXTRACT_PBF")/.source-stamp"
 BACKUP_DIR="$(dirname "$EXTRACT_PBF")/backups"
-SOURCE_TMP="${SOURCE_PBF}.tmp"
+# osmium infers format from the filename. Temporary PBFs must end in
+# .osm.pbf, not .osm.pbf.tmp.
+SOURCE_TMP="${SOURCE_PBF%.osm.pbf}.tmp.osm.pbf"
 EXTRACT_TMP="$(dirname "$EXTRACT_PBF")/current.new.osm.pbf"
 XML_TMP="$(dirname "$EXTRACT_XML")/current.new.osm"
 CHECKREFS_LOG="${TMP_ROOT}/${REGION_ID}-check-refs.log"
+# Leftover from the broken .osm.pbf.tmp naming; never a known-good file.
+SOURCE_TMP_LEGACY="${SOURCE_PBF}.tmp"
 
 if [[ "$SHOW_CONFIG" -eq 1 ]]; then
   print_region_config
@@ -774,9 +877,10 @@ require_cmd curl
 if [[ ! -f "$BOUNDARY" || ! -s "$BOUNDARY" ]]; then
   fail "Missing or empty boundary file: $(relpath "$BOUNDARY")"
 fi
+load_boundary_bbox
 
 mkdir -p "$(dirname "$SOURCE_PBF")" "$(dirname "$EXTRACT_PBF")" "$(dirname "$EXTRACT_XML")" "$TMP_ROOT" "$BACKUP_DIR"
-rm -f "$EXTRACT_TMP" "$XML_TMP" "$SOURCE_TMP"
+rm -f "$EXTRACT_TMP" "$XML_TMP" "$SOURCE_TMP" "$SOURCE_TMP_LEGACY"
 
 echo "OSM update directory: ${OSM_DIR}"
 print_region_config
@@ -860,15 +964,20 @@ AFTER_RELS="$INFO_RELS"
 AFTER_DATA_TS_FIRST="$INFO_DATA_TS_FIRST"
 AFTER_DATA_TS_LAST="$INFO_DATA_TS_LAST"
 
+echo "Extract header bbox:  (${INFO_HDR_MIN_LON:-none}, ${INFO_HDR_MIN_LAT:-none}, ${INFO_HDR_MAX_LON:-none}, ${INFO_HDR_MAX_LAT:-none})"
 echo "Extract data bbox:    (${INFO_MIN_LON}, ${INFO_MIN_LAT}, ${INFO_MAX_LON}, ${INFO_MAX_LAT})"
 echo "Extract objects:      nodes=$(format_int "$AFTER_NODES") ways=$(format_int "$AFTER_WAYS") relations=$(format_int "$AFTER_RELS")"
 
-if [[ -z "$INFO_MIN_LON" ]]; then
-  fail "Extracted PBF has no data bounding box"
+if [[ -n "$INFO_HDR_MIN_LON" ]]; then
+  if ! validate_bbox_inside_window "$INFO_HDR_MIN_LON" "$INFO_HDR_MIN_LAT" "$INFO_HDR_MAX_LON" "$INFO_HDR_MAX_LAT"; then
+    fail "Extract header/extraction bbox is outside the safety window (lon ${BBOX_LON_MIN}..${BBOX_LON_MAX}, lat ${BBOX_LAT_MIN}..${BBOX_LAT_MAX}): (${INFO_HDR_MIN_LON}, ${INFO_HDR_MIN_LAT}, ${INFO_HDR_MAX_LON}, ${INFO_HDR_MAX_LAT})"
+  fi
+  if ! bboxes_overlap "$INFO_HDR_MIN_LON" "$INFO_HDR_MIN_LAT" "$INFO_HDR_MAX_LON" "$INFO_HDR_MAX_LAT" \
+      "$BOUNDARY_MIN_LON" "$BOUNDARY_MIN_LAT" "$BOUNDARY_MAX_LON" "$BOUNDARY_MAX_LAT"; then
+    fail "Extract header bbox does not overlap the requested boundary"
+  fi
 fi
-if ! validate_bbox "$INFO_MIN_LON" "$INFO_MIN_LAT" "$INFO_MAX_LON" "$INFO_MAX_LAT"; then
-  fail "Extract data bounding box is outside the safety window (lon ${BBOX_LON_MIN}..${BBOX_LON_MAX}, lat ${BBOX_LAT_MIN}..${BBOX_LAT_MAX}): (${INFO_MIN_LON}, ${INFO_MIN_LAT}, ${INFO_MAX_LON}, ${INFO_MAX_LAT})"
-fi
+validate_data_overlaps_boundary "Extract" "$INFO_MIN_LON" "$INFO_MIN_LAT" "$INFO_MAX_LON" "$INFO_MAX_LAT"
 if (( AFTER_NODES < MIN_NODES || AFTER_WAYS < MIN_WAYS || AFTER_RELS < MIN_RELS )); then
   fail "Extract object counts are implausibly low (nodes=$(format_int "$AFTER_NODES") ways=$(format_int "$AFTER_WAYS") relations=$(format_int "$AFTER_RELS"))"
 fi
@@ -905,9 +1014,7 @@ XML_TS="$INFO_TIMESTAMP"
 XML_SIZE="$INFO_SIZE"
 echo "XML data bbox:        (${INFO_MIN_LON}, ${INFO_MIN_LAT}, ${INFO_MAX_LON}, ${INFO_MAX_LAT})"
 echo "XML objects:          nodes=$(format_int "$INFO_NODES") ways=$(format_int "$INFO_WAYS") relations=$(format_int "$INFO_RELS")"
-if ! validate_bbox "$INFO_MIN_LON" "$INFO_MIN_LAT" "$INFO_MAX_LON" "$INFO_MAX_LAT"; then
-  fail "XML data bounding box is outside the safety window: (${INFO_MIN_LON}, ${INFO_MIN_LAT}, ${INFO_MAX_LON}, ${INFO_MAX_LAT})"
-fi
+validate_data_overlaps_boundary "XML" "$INFO_MIN_LON" "$INFO_MIN_LAT" "$INFO_MAX_LON" "$INFO_MAX_LAT"
 if [[ "$INFO_NODES" -ne "$AFTER_NODES" || "$INFO_WAYS" -ne "$AFTER_WAYS" || "$INFO_RELS" -ne "$AFTER_RELS" ]]; then
   fail "XML object counts do not match extracted PBF"
 fi
