@@ -1,0 +1,2 @@
+*.sh text eol=lf
+update-osm.sh text eol=lf

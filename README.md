@@ -1,153 +1,284 @@
 # osm-strava
 
-## Detection of missing ways in OpenStreetMap based on Strava heatmaps
+Detect missing OpenStreetMap ways from [Strava](https://www.strava.com/) heatmap
+tiles and write a GeoJSON file suitable for a
+[MapRoulette](https://maproulette.org/) challenge.
 
-### Introduction
+The detector compares heatmap traces against a local OSM extract (or Overpass),
+masks pixels that already follow OSM objects, and emits point tasks for leftover
+traces that pass size and intensity checks.
 
-This program will detect missing ways in OSM for your favorite area, and generate a GeoJSON file that will enable you to create a [MapRoulette](https://maproulette.org/) challenge.
+License: [GNU GPL v3](LICENSE).
 
-### Installation
+## Current Mallorca setup
 
-Download the strava.py file on your computer. Then, create the directory */var/cache/strava* to store the Strava heat map tiles.
+Validated production usage for Mallorca:
 
-You may have to install some libraries if they are not already installed :
+- activity: `ride`
+- tiles: direct Strava Global Heatmap (`--strava-tiles strava`)
+- zoom: `14`
+- OSM mask distance: **35 m** (`-d`, default)
+- local OSM XML: `osm-data/islas-baleares-current.osm`
 
-- [pillow](https://pypi.org/project/Pillow/)
+Optional false-positive filters are **off by default**. They do not change the
+35 m mask, threshold, or `min_size`.
+
+Last measured Mallorca snapshot (same OSM extract, no task database):
+
+| Mode | Accepted | GeoJSON |
+|---|---:|---:|
+| Baseline (no suppression) | 189 | 189 |
+| `--suppress-parallel-osm` | 189 | 63 |
+| `--suppress-ferry` | 189 | 175 |
+| both flags | 189 | 54 |
+
+`accepted` means the candidate passed the normal detector. Optional suppression
+may omit it from GeoJSON afterwards; diagnostics still record `accepted=true`.
+
+## Requirements
+
+Python 3 with:
+
+- [Pillow](https://pypi.org/project/Pillow/)
 - [numpy](https://numpy.org/)
 - [shapely](https://pypi.org/project/shapely/)
+- [requests](https://pypi.org/project/requests/)
 
-### Usage
-
-Personal query
-
-```
-sudo python3 strava.py -c run -a boundary-vorarlberg.geojson -g strava-vorarlberg.geojson
-sudo python3 strava.py -c ride -a boundary-vorarlberg.geojson -g strava-vorarlberg.geojson
-```
+Windows / PowerShell:
 
 ```
-usage: strava.py [-h] [-a AREA] [-m MINLEVEL] [-d DISTANCE] [-s SIZE] [-z ZOOM] [-c ACTIVITY] [-o OFFSET] [-b TASKS_DB] [-g GEOJSON] [-v] [-q] [-x X] [-y Y] [--debug]
-
-optional arguments:
-  -h, --help            show this help message and exit
-  -a AREA, --area AREA  Area of interest (GeoJSON)
-  -m MINLEVEL, --minlevel MINLEVEL
-                        Minimum Strava level (0-255)
-  -d DISTANCE, --distance DISTANCE
-                        Maximum distance between Strava hot point and OSM way
-  -s SIZE, --size SIZE  Minimum size of Strava trace (in pixels)
-  -z ZOOM, --zoom ZOOM  Strava zoom level (10-15)
-  -c ACTIVITY, --activity ACTIVITY
-                        Strava activity (default=run)
-  -o OFFSET, --offset OFFSET
-                        Strava tile offset (0-3)
-  -b TASKS_DB, --tasks_db TASKS_DB
-                        Tasks database
-  -g GEOJSON, --geojson GEOJSON
-                        Output file
-  -v, --verbose         Display more information
-  -q, --quiet           Do not display progress
-  -x X, --x X           Strava Tile x coordinate (for debugging)
-  -y Y, --y Y           Strava Tile y coordinate (for debugging)
-  --debug               Debug mode
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install pillow numpy shapely requests
 ```
 
-### Description of parameters
+Tiles are cached under `cache/strava/` in this repository (not `/var/cache`).
 
-#### -a \<GeoJSON file\>, --area \<GeoJSON file\>
+### Direct Strava tiles
 
-The GeoJSON file must contains a multipolygon (or a collection of) describing the limits of the area of interest. You can download these files on the [OSM-Boundaries](https://osm-boundaries.com/) website.
+`--strava-tiles strava` currently supports **`-c ride` only**. Authentication:
 
-#### -m \<Level\>, --minlevel \<Level\>
+- environment variable `STRAVA_COOKIE`, or
+- file `.strava-cookie` in the repository root
 
-The threshold of Strava traces intensity. The range is [0,255] and the default value is 100.
+Never commit Strava cookies. `.strava-cookie` is gitignored.
 
-The image below shows the colours of all the intensities :
-![Strava colour palette](docs/palette.png)
+### Local OSM updates (optional, WSL)
 
-#### -d \<Distance\>, --distance \<Distance\>
+`update-osm.ps1` / `update-osm.sh` keep the Balearic extract current. In WSL you
+need:
 
-The minimal distance, in meters, from an OSM way to enable the detection. (default = 35).
+- `osmium-tool` (`osmium`)
+- `osmctools` (`osmupdate`)
+- `wget`
+- `python3`
 
-#### -s \<Size\>, --size \<Size\>
+## Usage
 
-Minimum size of Strava trace (in pixels) (default = 20).
+Baseline Mallorca run (no suppression):
 
-#### -z \<Zoom\>, --zoom \<Zoom\>
+```
+python strava.py -c ride --strava-tiles strava -z 14 `
+  -a boundaries/mallorca.geojson `
+  --osm-file osm-data/islas-baleares-current.osm `
+  -g output.geojson
+```
 
-Strava zoom level (10-15). **Warning**: only the level 15 has been tested (default value).
+With both optional suppressors and diagnostics:
 
-#### -c \<ACTIVITY\>, --activity \<ACTIVITY\>
+```
+python strava.py -c ride --strava-tiles strava -z 14 `
+  -a boundaries/mallorca.geojson `
+  --osm-file osm-data/islas-baleares-current.osm `
+  -g output.geojson `
+  --diagnostics diagnostics.csv `
+  --stats-json run-stats.json `
+  --suppress-parallel-osm `
+  --suppress-ferry `
+  -v
+```
 
-Strava activity (default=run)
+Single-tile debug (instead of `-a`):
 
-#### -o \<OFFSET\>, --offset \<OFFSET\>
+```
+python strava.py -c ride --strava-tiles strava -z 14 -x 8305 -y 6233 `
+  --osm-file osm-data/islas-baleares-current.osm -g tile.geojson
+```
 
-Strava tile offset (0-3). See below.
+Without `--osm-file`, OSM is loaded from Overpass (cached under `cache/`).
+`--refresh-osm` ignores that cache.
 
-####  -g \<output file\>, --geojson \<output file\>
+### CLI options
 
-Output file to be imported in MapRoulette.
+From `strava.py --help` (defaults in parentheses):
 
-#### -b \<Tasks_database\>, --tasks_db \<Tasks_database\>
+| Option | Meaning |
+|---|---|
+| `-a` / `--area` | Area GeoJSON (multipolygon / feature collection) |
+| `-x` / `-y` | Single Strava tile coordinates (debug; both required) |
+| `-c` / `--activity` | Activity (`run` default). Direct Strava tiles: `ride` only |
+| `--strava-tiles` | `freemap` (default), `nakarte`, or `strava` |
+| `-z` / `--zoom` | Tile zoom 10–15 (`15` default). Mallorca uses `14` |
+| `-m` / `--minlevel` | Intensity threshold 0–255 (`100`) |
+| `-s` / `--size` | Minimum component size in pixels (`20`) |
+| `-d` / `--distance` | OSM mask buffer in metres (`35`) |
+| `-g` / `--geojson` | Output GeoJSON (GeoJSONSeq with RS). stdout if omitted |
+| `-o` / `--offset` | Tile offset 0–3 (skip contiguous tiles; see workflow) |
+| `-b` / `--tasks_db` | Read-only SQLite of already processed MapRoulette tasks |
+| `-v` / `--verbose` | Extra progress |
+| `-q` / `--quiet` | No progress dots |
+| `--debug` | Debug images / extra logs |
+| `--osm-file` | Local OSM XML instead of Overpass |
+| `--overpass-url` | Overpass interpreter URL |
+| `--refresh-osm` | Redownload Overpass cache |
+| `--stats-json` | Write run statistics JSON |
+| `--diagnostics` | Optional per-candidate CSV (does not change detection) |
+| `--suppress-parallel-osm` | Opt-in parallel-OSM suppression (default off) |
+| `--suppress-ferry` | Opt-in ferry-candidate suppression (default off) |
 
-Tasks database. If you do several rounds (see worflow explained below), this database must contain the MapRoulette tasks already processed, to avoid new detection of tasks marked as "Not an issue".
+Area polygons can be downloaded from [OSM-Boundaries](https://osm-boundaries.com/).
+Example files live in `boundaries/`.
 
-#### -x \<X\>, --x \<X\> and -y \<Y\>, --y \<Y\>
+The intensity colour scale is shown in `docs/palette.png`.
 
-For debugging, instead of providing an area, you can provide the x and y coordinates of the Strava tile you want to process.
+## Optional suppression
 
-### Workflows
+Both flags are **opt-in** and default **off**. They run after normal detection.
+Flood-fill and task IDs are unchanged. A candidate can match both rules; it is
+counted once in the GeoJSON union.
 
-This is an iterative process. When the MapRoulette challenge is finished, you can run again strava.py to detect more missing ways, for example by lowering the detection thresholds. You'll stop when there are too many tasks marked as "Not an issue".
+### `--suppress-parallel-osm`
 
-#### Simple workflow
+Omits accepted candidates whose heatmap component follows existing OSM:
 
-- Step #1: Download the boundary of your area of interest on the [OSM-Boundaries](https://osm-boundaries.com/) website.
-- Step #2: Run strava.py.
-- Step #3: Create a new MapRoulette challenge and import the GeoJSON file created in step #2.
-- Step #4: Wait until the MapRoulette challenge is finished.
-- Step #5: In MapRoulette, export the project data in CSV format (see [Exporting Challenge Data](https://learn.maproulette.org/documentation/exporting-challenge-data/)).
-- Step #6: Convert the CSV file to a Sqlite3 database:
+    follow100 >= 0.70 AND parallel15 >= 0.70
 
-`sqlite3 tasks.sqlite ".import --csv project_XXXXX_tasks.csv tasks" "create index tasks_idx on tasks(TaskName);"`
-- Step #7: Run again strava.py with the new "-b tasks.sqlite" parameter.
-- Step #8: Rebuild the MapRoulette challenge to add the new tasks.
+This targets GPS scatter running parallel to mapped ways. It does **not** change
+the 35 m mask. Diagnostics column: `suppressed_parallel_osm`.
 
-Repeat steps #4 to #8 until there are too many tasks marked as "Not an issue".
+Mallorca (measured): 126 parallel matches, GeoJSON 63.
 
-#### Advanced workflow
+### `--suppress-ferry`
 
-To minimize the multiple detection of missing ways, you may choose to avoid processing of contiguous Strava heatmap tiles.
+Candidate-level rule on the peak location:
 
-- Step #1: Download the boundary of your area of interest on the [OSM-Boundaries](https://osm-boundaries.com/) website.
-- Step #2: Run strava.py with the "-o 0" parameter.
-- Step #3: Create a new MapRoulette challenge and import the GeoJSON file created in step #2.
-- Step #4: Wait until the MapRoulette challenge is finished.
-- Step #5: Run strava.py with the "-o 1" parameter.
-- Step #6: Rebuild the MapRoulette challenge to add the new tasks.
-- Step #7: Wait until the MapRoulette challenge is finished.
-- Step #8: Run strava.py with the "-o 2" parameter.
-- Step #9: Rebuild the MapRoulette challenge to add the new tasks.
-- Step #10: Wait until the MapRoulette challenge is finished.
-- Step #11: Run strava.py with the "-o 3" parameter.
-- Step #12: Rebuild the MapRoulette challenge to add the new tasks.
-- Step #13: Wait until the MapRoulette challenge is finished.
-- Step #14: In MapRoulette, export the project data in CSV format (see [Exporting Challenge Data](https://learn.maproulette.org/documentation/exporting-challenge-data/)).
-- Step #15: Convert the CSV file to a Sqlite3 database:
+    nearest_ferry_distance_m is populated AND nearest_ferry_distance_m <= 500
 
-`sqlite3 tasks.sqlite ".import --csv project_XXXXX_tasks.csv tasks" "create index tasks_idx on tasks(TaskName);"`
-- Step #16: Run strava.py with the new "-b tasks.sqlite" parameter and with the "-o 0" parameter.
-- Step #17: Rebuild the MapRoulette challenge to add the new tasks.
-- Step #18: Wait until the MapRoulette challenge is finished.
-- Step #19: Run strava.py with the "-b tasks.sqlite" and the "-o 1" parameter.
-- Step #20: Rebuild the MapRoulette challenge to add the new tasks.
-- Step #21: Wait until the MapRoulette challenge is finished.
-- Step #22: Run strava.py with the "-b tasks.sqlite" and the "-o 2" parameter.
-- Step #23: Rebuild the MapRoulette challenge to add the new tasks.
-- Step #24: Wait until the MapRoulette challenge is finished.
-- Step #25: Run strava.py with the "-b tasks.sqlite" and the "-o 3" parameter.
-- Step #26: Rebuild the MapRoulette challenge to add the new tasks.
-- Step #27: Wait until the MapRoulette challenge is finished.
+This does **not** enlarge the OSM mask around `route=ferry` to 500 m.
+Diagnostics column: `suppressed_ferry`.
 
-Repeat steps #14 to #27 until there are too many tasks marked as "Not an issue".
+Mallorca (measured): 14 ferry matches, GeoJSON 175 if used alone.
+
+### Combined statistics
+
+With both flags, Mallorca measured:
+
+- parallel 126
+- ferry 14
+- overlap 5
+- union suppressed 135
+- GeoJSON 54
+
+Summary fields:
+
+- raw detections
+- rejected (too small)
+- accepted (before optional suppression)
+- suppressed parallel to OSM
+- suppressed ferry traces
+- suppression overlap
+- total suppressed
+- GeoJSON features (after suppression and `-b` exclusions)
+
+Known Mallorca controls that must remain in GeoJSON with both flags:
+
+- `14/8305/6233/875/927`
+- `14/8308/6230/389/806`
+- `14/8306/6225/102/938`
+
+## Local OSM data (`osm-data/`)
+
+```
+osm-data/
+    islas-baleares-current.osm.pbf   # managed extract (gitignored)
+    islas-baleares-current.osm       # XML for --osm-file (gitignored)
+    islas-baleares.poly              # clip polygon (tracked)
+    backups/                         # previous PBFs (gitignored, limited)
+```
+
+Update from PowerShell:
+
+```
+.\update-osm.ps1
+```
+
+The script runs `update-osm.sh` in WSL. It:
+
+- applies Planet **minutely** replication with `osmupdate`
+- always clips with `islas-baleares.poly` (`-B`)
+- validates timestamps, regional bbox, and object counts
+- backs up the previous PBF (keeps a small number of backups)
+- converts PBF → XML with `osmium cat`
+- validates XML provenance/counts against the PBF
+
+The clipped regional file may not have complete references for objects that
+cross the polygon boundary. That is acceptable for Mallorca detection, but the
+file is not a generally referentially-complete OSM extract.
+
+## Diagnostics and research
+
+`--diagnostics FILE` writes a CSV for calibration. It does **not** change
+detection unless a suppression flag is also enabled.
+
+`analyze_diagnostics.py` is offline validation. Join MapRoulette exports with
+`candidate_id == TaskName`. See [validation/README.md](validation/README.md).
+
+Main diagnostic groups (not a full column list):
+
+- Strava component metrics (pixels, intensity, elongation)
+- nearest OSM object and distances
+- nearest ferry / construction
+- follow / parallel geometry vs local OSM
+- suppression status (`suppressed_parallel_osm`, `suppressed_ferry`, `written_to_geojson`)
+
+Generated analysis CSV/GeoJSON files are gitignored.
+
+## MapRoulette workflow
+
+This is iterative. After a challenge round, rerun with a task database so
+already reviewed “Not an Issue” / “Too Hard” tasks are not written again.
+
+### Simple workflow
+
+1. Download an area boundary (or use `boundaries/`).
+2. Run `strava.py`.
+3. Create a MapRoulette challenge and import the GeoJSON.
+4. Wait until the challenge is finished.
+5. Export challenge data as CSV
+   ([Exporting Challenge Data](https://learn.maproulette.org/documentation/exporting-challenge-data/)).
+6. Convert to SQLite:
+
+   `sqlite3 tasks.sqlite ".import --csv project_XXXXX_tasks.csv tasks" "create index tasks_idx on tasks(TaskName);"`
+
+7. Rerun `strava.py` with `-b tasks.sqlite`.
+8. Rebuild the challenge to add new tasks.
+
+Repeat until too many remaining tasks are “Not an Issue”.
+
+`-b` is read-only. Statuses `Not_an_Issue` and `Too_Hard` are omitted from
+GeoJSON. `Fixed` / `Already_Fixed` that still match the heatmap produce a
+warning (the way may not actually be in OSM yet).
+
+### Offset workflow
+
+`-o 0..3` processes every other tile so adjacent heatmap tiles are not handled
+in the same round. Run offset 0, then 1, 2, 3, importing each GeoJSON before the
+next round. Combine with `-b` on later passes.
+
+## Other files
+
+- `strava.py` — current detector
+- `diagnostics.py` — shared geometry / diagnostics / suppression helpers
+- `analyze_diagnostics.py` — offline rule analysis
+- `strava-ride.py` — older ride-oriented script (Overpass only; not the current detector)
+- `update-osm.ps1` / `update-osm.sh` — Balearic OSM extract updater

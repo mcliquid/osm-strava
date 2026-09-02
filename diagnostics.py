@@ -1,0 +1,697 @@
+# Component geometry metrics for osm-strava diagnostics and opt-in suppression.
+# Detection, masking, and GeoJSON geometry are owned by strava.py.
+import csv
+import json
+import math
+from collections import deque
+
+import numpy as np
+from shapely.geometry import LineString, Point, Polygon, box as shapely_box
+from shapely.strtree import STRtree
+
+# Diagnostic-only neighbourhood around a component (Web Mercator metres).
+_OSM_NEIGHBOURHOOD_M = 100.0
+_MAX_COMPONENT_SAMPLES = 160
+_TANGENT_WINDOW_M = 20.0
+_LOCAL_COMPONENT_RADIUS_M = 30.0
+_MIN_TANGENT_SPAN_M = 1.0
+_MAX_ELONGATION = 1e6
+
+
+DIAGNOSTIC_COLUMNS = [
+    "candidate_id",
+    "tile_z",
+    "tile_x",
+    "tile_y",
+    "candidate_index_in_tile",
+    "peak_row",
+    "peak_col",
+    "center_lon",
+    "center_lat",
+    "geometry_length_m",
+    "geometry_area_m2",
+    "component_pixels",
+    "component_width_px",
+    "component_height_px",
+    "strava_min",
+    "strava_max",
+    "strava_mean",
+    "strava_median",
+    "strava_p75",
+    "strava_p90",
+    "strava_p95",
+    "nearest_osm_distance_m",
+    "nearest_osm_type",
+    "nearest_osm_id",
+    "nearest_osm_highway",
+    "nearest_osm_railway",
+    "nearest_osm_aeroway",
+    "nearest_osm_leisure",
+    "nearest_osm_route",
+    "nearest_osm_construction",
+    "nearest_osm_name",
+    "nearest_osm_tags",
+    "nearest_ferry_distance_m",
+    "nearest_ferry_id",
+    "nearest_ferry_name",
+    "nearest_construction_distance_m",
+    "nearest_construction_id",
+    "nearest_construction_name",
+    "component_orientation_deg",
+    "component_elongation",
+    "osm_distance_min_m",
+    "osm_distance_p25_m",
+    "osm_distance_median_m",
+    "osm_distance_p75_m",
+    "osm_distance_p90_m",
+    "osm_distance_max_m",
+    "osm_distance_iqr_m",
+    "osm_follow_fraction_50m",
+    "osm_follow_fraction_75m",
+    "osm_follow_fraction_100m",
+    "osm_parallel_angle_median_deg",
+    "osm_parallel_fraction_15deg",
+    "osm_parallel_fraction_30deg",
+    "raw_candidate",
+    "too_small",
+    "accepted",
+    "written_to_geojson",
+    "suppressed_parallel_osm",
+    "suppressed_ferry",
+]
+
+
+def _fmt_float(value, digits=6):
+    if value is None or value == "":
+        return ""
+    return f"{float(value):.{digits}f}".rstrip("0").rstrip(".")
+
+
+def _fmt_int(value):
+    if value is None or value == "":
+        return ""
+    return str(int(value))
+
+
+def _bool_csv(value):
+    return "true" if value else "false"
+
+
+def extract_component_pixels(heatmap, row, col, threshold):
+    """4-connected component of pixels >= threshold, same connectivity as check_trace_area.
+
+    Operates on a copy-safe array; does not modify detection state.
+    Returns (values, rows, cols) as numpy arrays, or empty arrays if the seed is cold.
+    """
+    height, width = heatmap.shape
+    if row < 0 or col < 0 or row >= height or col >= width:
+        return np.array([]), np.array([]), np.array([])
+    if heatmap[row, col] < threshold:
+        return np.array([]), np.array([]), np.array([])
+
+    seen = np.zeros(heatmap.shape, dtype=bool)
+    seen[row, col] = True
+    queue = deque([(int(row), int(col))])
+    values = []
+    rows = []
+    cols = []
+    while queue:
+        r, c = queue.popleft()
+        values.append(int(heatmap[r, c]))
+        rows.append(r)
+        cols.append(c)
+        for nr, nc in ((r + 1, c), (r - 1, c), (r, c + 1), (r, c - 1)):
+            if nr < 0 or nc < 0 or nr >= height or nc >= width:
+                continue
+            if seen[nr, nc]:
+                continue
+            if heatmap[nr, nc] < threshold:
+                continue
+            seen[nr, nc] = True
+            queue.append((nr, nc))
+    return np.asarray(values), np.asarray(rows), np.asarray(cols)
+
+
+def component_strava_stats(values):
+    if values.size == 0:
+        return {
+            "strava_min": "",
+            "strava_max": "",
+            "strava_mean": "",
+            "strava_median": "",
+            "strava_p75": "",
+            "strava_p90": "",
+            "strava_p95": "",
+        }
+    return {
+        "strava_min": _fmt_int(int(np.min(values))),
+        "strava_max": _fmt_int(int(np.max(values))),
+        "strava_mean": _fmt_float(float(np.mean(values)), 4),
+        "strava_median": _fmt_float(float(np.median(values)), 4),
+        "strava_p75": _fmt_float(float(np.percentile(values, 75)), 4),
+        "strava_p90": _fmt_float(float(np.percentile(values, 90)), 4),
+        "strava_p95": _fmt_float(float(np.percentile(values, 95)), 4),
+    }
+
+
+def _item_geometry(item):
+    coords = item.coords
+    if not coords:
+        return None
+    if len(coords) == 1:
+        return Point(coords[0])
+    if item.fill_polygon and len(coords) >= 4:
+        try:
+            poly = Polygon(coords)
+            if poly.is_valid and not poly.is_empty:
+                return poly
+        except Exception:
+            pass
+    try:
+        return LineString(coords)
+    except Exception:
+        return Point(coords[0])
+
+
+def _item_tags(item):
+    tags = getattr(item, "tags", None)
+    if not tags:
+        return {}
+    return tags
+
+
+def pixels_to_mercator(rows, cols, bbox_merc, pixel_size):
+    """Pixel (row, col) -> Web Mercator, same as reverse_transform without lon/lat round-trip."""
+    merc_x = cols.astype(np.float64) * pixel_size + bbox_merc[1]
+    merc_y = bbox_merc[0] - rows.astype(np.float64) * pixel_size
+    return np.column_stack((merc_x, merc_y))
+
+
+def _sample_indices(n, max_samples=_MAX_COMPONENT_SAMPLES):
+    if n <= max_samples:
+        return np.arange(n, dtype=int)
+    return np.unique(np.linspace(0, n - 1, max_samples).round().astype(int))
+
+
+def _safe_elongation(lam1, lam2):
+    if lam1 <= 1e-18:
+        return None
+    if lam2 <= 1e-18:
+        return _MAX_ELONGATION
+    return min(lam1 / lam2, _MAX_ELONGATION)
+
+
+def component_pca(merc_xy):
+    """Return (orientation_deg 0..180, elongation, axis_vector) or Nones if degenerate."""
+    if merc_xy.shape[0] < 2:
+        return None, None, None
+    centered = merc_xy - merc_xy.mean(axis=0)
+    if merc_xy.shape[0] == 2:
+        delta = centered[1]
+        if float(np.dot(delta, delta)) < 1e-12:
+            return None, None, None
+        vec = delta / np.linalg.norm(delta)
+        angle = math.degrees(math.atan2(vec[1], vec[0])) % 180.0
+        return angle, _MAX_ELONGATION, vec
+    cov = np.cov(centered, rowvar=False)
+    if cov.shape != (2, 2) or not np.all(np.isfinite(cov)):
+        return None, None, None
+    eigvals, eigvecs = np.linalg.eigh(cov)
+    order = np.argsort(eigvals)[::-1]
+    eigvals = eigvals[order]
+    eigvecs = eigvecs[:, order]
+    vec = eigvecs[:, 0]
+    if float(np.dot(vec, vec)) < 1e-18:
+        return None, None, None
+    vec = vec / np.linalg.norm(vec)
+    angle = math.degrees(math.atan2(vec[1], vec[0])) % 180.0
+    lam1 = float(max(eigvals[0], 0.0))
+    lam2 = float(max(eigvals[1], 0.0))
+    elong = _safe_elongation(lam1, lam2)
+    if elong is None:
+        return None, None, None
+    return angle, elong, vec
+
+
+def _orientation_diff_deg(ax, ay, bx, by):
+    """Smallest angle between two undirected axes, 0=parallel, 90=perpendicular."""
+    n1 = math.hypot(ax, ay)
+    n2 = math.hypot(bx, by)
+    if n1 < 1e-12 or n2 < 1e-12:
+        return None
+    cos = abs((ax * bx + ay * by) / (n1 * n2))
+    cos = min(1.0, max(0.0, cos))
+    return math.degrees(math.acos(cos))
+
+
+def _as_lines(geom):
+    if geom is None or geom.is_empty:
+        return []
+    gtype = geom.geom_type
+    if gtype == "LineString":
+        return [geom]
+    if gtype == "LinearRing":
+        return [LineString(geom.coords)]
+    if gtype == "Polygon":
+        return [geom.exterior]
+    if gtype in ("MultiLineString", "MultiPolygon", "GeometryCollection"):
+        lines = []
+        for part in geom.geoms:
+            lines.extend(_as_lines(part))
+        return lines
+    return []
+
+
+def local_tangent(geom, point, window_m=_TANGENT_WINDOW_M):
+    lines = _as_lines(geom)
+    best_line = None
+    best_dist = None
+    for line in lines:
+        if line.length <= 0:
+            continue
+        dist = line.distance(point)
+        if best_dist is None or dist < best_dist:
+            best_dist = dist
+            best_line = line
+    if best_line is None or best_line.length < _MIN_TANGENT_SPAN_M:
+        return None
+    along = best_line.project(point)
+    span = min(window_m, best_line.length / 2.0)
+    start = max(0.0, along - span)
+    end = min(best_line.length, along + span)
+    if end - start < _MIN_TANGENT_SPAN_M:
+        return None
+    p1 = best_line.interpolate(start)
+    p2 = best_line.interpolate(end)
+    dx = p2.x - p1.x
+    dy = p2.y - p1.y
+    if dx * dx + dy * dy < 1e-12:
+        return None
+    return dx, dy
+
+
+def _local_component_direction(all_xy, sample_xy, global_vec, radius=_LOCAL_COMPONENT_RADIUS_M):
+    delta = all_xy - sample_xy
+    nearby = all_xy[np.sum(delta * delta, axis=1) <= radius * radius]
+    if nearby.shape[0] >= 5:
+        _angle, _elong, vec = component_pca(nearby)
+        if vec is not None:
+            return vec
+    return global_vec
+
+
+PARALLEL_OSM_FOLLOW100_MIN = 0.70
+PARALLEL_OSM_PARALLEL15_MIN = 0.70
+FERRY_SUPPRESS_MAX_M = 500.0
+
+
+def _parse_metric_float(value):
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def follow_metrics_from_component_pixels(values, rows, cols, bbox_merc, pixel_size, lookup):
+    """PCA + local OSM follow/parallel metrics for already extracted component pixels."""
+    if values.size == 0 or bbox_merc is None:
+        return None, None, _empty_follow_metrics()
+    merc_xy = pixels_to_mercator(rows, cols, bbox_merc, pixel_size)
+    angle, elong, axis_vec = component_pca(merc_xy)
+    follow = _component_osm_follow_metrics(merc_xy, axis_vec, lookup)
+    return angle, elong, follow
+
+
+def component_osm_follow_metrics(
+    heatmap, peak_row, peak_col, threshold, bbox_merc, pixel_size, lookup
+):
+    """Follow/parallel metrics for the 4-connected >= threshold component.
+
+    Same definitions as the diagnostics CSV columns osm_follow_fraction_* and
+    osm_parallel_fraction_*. Used by both diagnostics export and production
+    --suppress-parallel-osm.
+    """
+    values, rows, cols = extract_component_pixels(
+        heatmap, peak_row, peak_col, threshold
+    )
+    _angle, _elong, follow = follow_metrics_from_component_pixels(
+        values, rows, cols, bbox_merc, pixel_size, lookup
+    )
+    return follow
+
+
+def should_suppress_parallel_osm(follow_metrics):
+    """True if follow100 >= 0.70 and parallel15 >= 0.70. Blank metrics do not match."""
+    follow100 = _parse_metric_float((follow_metrics or {}).get("osm_follow_fraction_100m"))
+    parallel15 = _parse_metric_float((follow_metrics or {}).get("osm_parallel_fraction_15deg"))
+    return (
+        follow100 is not None
+        and follow100 >= PARALLEL_OSM_FOLLOW100_MIN
+        and parallel15 is not None
+        and parallel15 >= PARALLEL_OSM_PARALLEL15_MIN
+    )
+
+
+def nearest_ferry_distance_m(lookup, merc_x, merc_y):
+    """Nearest route=ferry distance in metres via the existing ferry STRtree."""
+    if lookup is None:
+        return None
+    found = lookup.nearest(merc_x, merc_y, "ferry")
+    if found is None:
+        return None
+    _item, dist = found
+    return None if dist is None else float(dist)
+
+
+def should_suppress_ferry(ferry_distance_m):
+    """True if nearest_ferry_distance_m is populated and <= 500. Blank does not match."""
+    dist = _parse_metric_float(ferry_distance_m)
+    return dist is not None and dist <= FERRY_SUPPRESS_MAX_M
+
+
+def _empty_follow_metrics():
+    return {
+        "osm_distance_min_m": "",
+        "osm_distance_p25_m": "",
+        "osm_distance_median_m": "",
+        "osm_distance_p75_m": "",
+        "osm_distance_p90_m": "",
+        "osm_distance_max_m": "",
+        "osm_distance_iqr_m": "",
+        "osm_follow_fraction_50m": "",
+        "osm_follow_fraction_75m": "",
+        "osm_follow_fraction_100m": "",
+        "osm_parallel_angle_median_deg": "",
+        "osm_parallel_fraction_15deg": "",
+        "osm_parallel_fraction_30deg": "",
+    }
+
+
+def _sample_component_xy(merc_xy, axis_vec):
+    n = merc_xy.shape[0]
+    if axis_vec is not None:
+        order = np.argsort(merc_xy @ np.asarray(axis_vec, dtype=np.float64))
+        return merc_xy[order[_sample_indices(n)]]
+    return merc_xy[_sample_indices(n)]
+
+
+def _nearest_local_geom(local_geoms, local_tree, point):
+    if not local_geoms or local_tree is None:
+        return None, None
+    index = local_tree.nearest(point)
+    if index is None:
+        return None, None
+    idx = int(np.asarray(index).reshape(-1)[0])
+    geom = local_geoms[idx]
+    return geom, float(geom.distance(point))
+
+
+def _component_osm_follow_metrics(merc_xy, axis_vec, lookup):
+    empty = _empty_follow_metrics()
+    if lookup is None or merc_xy.size == 0:
+        return empty
+
+    minx, miny = merc_xy.min(axis=0)
+    maxx, maxy = merc_xy.max(axis=0)
+    local_geoms = lookup.geoms_near_envelope(minx, miny, maxx, maxy)
+    samples = _sample_component_xy(merc_xy, axis_vec)
+    n_samples = samples.shape[0]
+    if n_samples == 0:
+        return empty
+    if not local_geoms:
+        empty["osm_follow_fraction_50m"] = _fmt_float(0.0, 4)
+        empty["osm_follow_fraction_75m"] = _fmt_float(0.0, 4)
+        empty["osm_follow_fraction_100m"] = _fmt_float(0.0, 4)
+        return empty
+
+    local_tree = STRtree(local_geoms)
+    distances = np.empty(n_samples, dtype=np.float64)
+    angles = []
+    for i, xy in enumerate(samples):
+        point = Point(float(xy[0]), float(xy[1]))
+        geom, dist = _nearest_local_geom(local_geoms, local_tree, point)
+        if dist is None:
+            distances[i] = np.nan
+            continue
+        distances[i] = dist
+        tangent = local_tangent(geom, point) if geom is not None else None
+        if tangent is None:
+            continue
+        local_vec = _local_component_direction(merc_xy, xy, axis_vec)
+        if local_vec is None:
+            continue
+        angle = _orientation_diff_deg(local_vec[0], local_vec[1], tangent[0], tangent[1])
+        if angle is not None:
+            angles.append(angle)
+
+    finite = distances[np.isfinite(distances)]
+    follow = np.where(np.isfinite(distances), distances, np.inf)
+    if finite.size == 0:
+        empty["osm_follow_fraction_50m"] = _fmt_float(0.0, 4)
+        empty["osm_follow_fraction_75m"] = _fmt_float(0.0, 4)
+        empty["osm_follow_fraction_100m"] = _fmt_float(0.0, 4)
+        return empty
+
+    p25 = float(np.percentile(finite, 25))
+    p75 = float(np.percentile(finite, 75))
+    out = {
+        "osm_distance_min_m": _fmt_float(float(np.min(finite)), 3),
+        "osm_distance_p25_m": _fmt_float(p25, 3),
+        "osm_distance_median_m": _fmt_float(float(np.median(finite)), 3),
+        "osm_distance_p75_m": _fmt_float(p75, 3),
+        "osm_distance_p90_m": _fmt_float(float(np.percentile(finite, 90)), 3),
+        "osm_distance_max_m": _fmt_float(float(np.max(finite)), 3),
+        "osm_distance_iqr_m": _fmt_float(p75 - p25, 3),
+        "osm_follow_fraction_50m": _fmt_float(float(np.mean(follow <= 50.0)), 4),
+        "osm_follow_fraction_75m": _fmt_float(float(np.mean(follow <= 75.0)), 4),
+        "osm_follow_fraction_100m": _fmt_float(float(np.mean(follow <= 100.0)), 4),
+        "osm_parallel_angle_median_deg": "",
+        "osm_parallel_fraction_15deg": "",
+        "osm_parallel_fraction_30deg": "",
+    }
+    if angles:
+        ang = np.asarray(angles, dtype=np.float64)
+        out["osm_parallel_angle_median_deg"] = _fmt_float(float(np.median(ang)), 2)
+        out["osm_parallel_fraction_15deg"] = _fmt_float(float(np.mean(ang <= 15.0)), 4)
+        out["osm_parallel_fraction_30deg"] = _fmt_float(float(np.mean(ang <= 30.0)), 4)
+    return out
+
+
+class DiagnosticOsmLookup:
+    """Nearest-neighbor queries over the same relevant OSM universe used for masking."""
+
+    def __init__(self, items, construction_items=None):
+        self._all = self._prepare(items)
+        ferry_items = [
+            item for item in items
+            if _item_tags(item).get("route") == "ferry"
+        ]
+        self._ferry = self._prepare(ferry_items)
+        self._construction = self._prepare(construction_items or [])
+
+    @staticmethod
+    def _prepare(items):
+        geoms = []
+        kept = []
+        for item in items or []:
+            geom = _item_geometry(item)
+            if geom is None or geom.is_empty:
+                continue
+            geoms.append(geom)
+            kept.append(item)
+        tree = STRtree(geoms) if geoms else None
+        return {"items": kept, "geoms": geoms, "tree": tree}
+
+    def nearest(self, merc_x, merc_y, kind="all"):
+        store = {"all": self._all, "ferry": self._ferry, "construction": self._construction}[kind]
+        if not store["items"] or store["tree"] is None:
+            return None
+        point = Point(merc_x, merc_y)
+        index = store["tree"].nearest(point)
+        if index is None:
+            return None
+        idx = int(np.asarray(index).reshape(-1)[0])
+        geom = store["geoms"][idx]
+        item = store["items"][idx]
+        return item, float(geom.distance(point))
+
+    def geoms_near_envelope(self, minx, miny, maxx, maxy, padding=_OSM_NEIGHBOURHOOD_M):
+        store = self._all
+        if not store["items"] or store["tree"] is None:
+            return []
+        env = shapely_box(minx - padding, miny - padding, maxx + padding, maxy + padding)
+        indices = store["tree"].query(env, predicate="intersects")
+        idxs = np.asarray(indices).reshape(-1)
+        if idxs.size == 0:
+            return []
+        return [store["geoms"][int(i)] for i in idxs]
+
+
+def _osm_fields(item, distance_m):
+    if item is None:
+        return {
+            "nearest_osm_distance_m": "",
+            "nearest_osm_type": "",
+            "nearest_osm_id": "",
+            "nearest_osm_highway": "",
+            "nearest_osm_railway": "",
+            "nearest_osm_aeroway": "",
+            "nearest_osm_leisure": "",
+            "nearest_osm_route": "",
+            "nearest_osm_construction": "",
+            "nearest_osm_name": "",
+            "nearest_osm_tags": "",
+        }
+    tags = _item_tags(item)
+    return {
+        "nearest_osm_distance_m": _fmt_float(distance_m, 3),
+        "nearest_osm_type": item.source,
+        "nearest_osm_id": str(item.osm_id),
+        "nearest_osm_highway": tags.get("highway", ""),
+        "nearest_osm_railway": tags.get("railway", ""),
+        "nearest_osm_aeroway": tags.get("aeroway", ""),
+        "nearest_osm_leisure": tags.get("leisure", ""),
+        "nearest_osm_route": tags.get("route", ""),
+        "nearest_osm_construction": tags.get("construction", ""),
+        "nearest_osm_name": tags.get("name", ""),
+        "nearest_osm_tags": json.dumps(tags, ensure_ascii=False, separators=(",", ":")),
+    }
+
+
+def _named_distance_fields(prefix, item, distance_m):
+    if item is None:
+        return {
+            f"{prefix}_distance_m": "",
+            f"{prefix}_id": "",
+            f"{prefix}_name": "",
+        }
+    tags = _item_tags(item)
+    return {
+        f"{prefix}_distance_m": _fmt_float(distance_m, 3),
+        f"{prefix}_id": str(item.osm_id),
+        f"{prefix}_name": tags.get("name", ""),
+    }
+
+
+def build_diagnostic_row(
+    *,
+    zoom,
+    tile_x,
+    tile_y,
+    candidate_index,
+    peak_row,
+    peak_col,
+    center_lon,
+    center_lat,
+    pixel_size_m,
+    heatmap_snapshot,
+    threshold,
+    lookup,
+    lon2x,
+    lat2y,
+    too_small,
+    accepted,
+    written_to_geojson,
+    bbox_merc=None,
+    suppressed_parallel_osm=False,
+    suppressed_ferry=False,
+):
+    candidate_id = f"{zoom}/{tile_x}/{tile_y}/{peak_row}/{peak_col}"
+    values, rows, cols = extract_component_pixels(
+        heatmap_snapshot, peak_row, peak_col, threshold
+    )
+    n_pixels = int(values.size)
+    if n_pixels:
+        width_px = int(np.max(cols) - np.min(cols) + 1)
+        height_px = int(np.max(rows) - np.min(rows) + 1)
+        length_m = math.hypot(width_px, height_px) * pixel_size_m
+        area_m2 = n_pixels * (pixel_size_m ** 2)
+    else:
+        width_px = ""
+        height_px = ""
+        length_m = ""
+        area_m2 = ""
+
+    row = {
+        "candidate_id": candidate_id,
+        "tile_z": zoom,
+        "tile_x": tile_x,
+        "tile_y": tile_y,
+        "candidate_index_in_tile": candidate_index,
+        "peak_row": peak_row,
+        "peak_col": peak_col,
+        "center_lon": _fmt_float(center_lon, 10),
+        "center_lat": _fmt_float(center_lat, 10),
+        "geometry_length_m": _fmt_float(length_m, 3) if length_m != "" else "",
+        "geometry_area_m2": _fmt_float(area_m2, 3) if area_m2 != "" else "",
+        "component_pixels": _fmt_int(n_pixels) if n_pixels else "",
+        "component_width_px": _fmt_int(width_px) if width_px != "" else "",
+        "component_height_px": _fmt_int(height_px) if height_px != "" else "",
+    }
+    row.update(component_strava_stats(values))
+
+    merc_x = lon2x(center_lon)
+    merc_y = lat2y(center_lat)
+    nearest = lookup.nearest(merc_x, merc_y, "all") if lookup is not None else None
+    ferry = lookup.nearest(merc_x, merc_y, "ferry") if lookup is not None else None
+    construction = lookup.nearest(merc_x, merc_y, "construction") if lookup is not None else None
+
+    if nearest is None:
+        row.update(_osm_fields(None, None))
+    else:
+        item, dist = nearest
+        row.update(_osm_fields(item, dist))
+    if ferry is None:
+        row.update(_named_distance_fields("nearest_ferry", None, None))
+    else:
+        item, dist = ferry
+        row.update(_named_distance_fields("nearest_ferry", item, dist))
+    if construction is None:
+        row.update(_named_distance_fields("nearest_construction", None, None))
+    else:
+        item, dist = construction
+        row.update(_named_distance_fields("nearest_construction", item, dist))
+
+    angle, elong, follow = follow_metrics_from_component_pixels(
+        values, rows, cols, bbox_merc, pixel_size_m, lookup
+    )
+    row["component_orientation_deg"] = _fmt_float(angle, 2) if angle is not None else ""
+    row["component_elongation"] = _fmt_float(elong, 3) if elong is not None else ""
+    row.update(follow)
+
+    row["raw_candidate"] = _bool_csv(True)
+    row["too_small"] = _bool_csv(too_small)
+    row["accepted"] = _bool_csv(accepted)
+    row["written_to_geojson"] = _bool_csv(written_to_geojson)
+    row["suppressed_parallel_osm"] = _bool_csv(suppressed_parallel_osm)
+    row["suppressed_ferry"] = _bool_csv(suppressed_ferry)
+    return row
+
+
+class DiagnosticWriter:
+    def __init__(self, path):
+        self.path = path
+        self.rows_written = 0
+        self._fh = open(path, "w", encoding="utf-8", newline="")
+        self._writer = csv.DictWriter(
+            self._fh,
+            fieldnames=DIAGNOSTIC_COLUMNS,
+            extrasaction="ignore",
+        )
+        self._writer.writeheader()
+        self._fh.flush()
+
+    def write_row(self, row):
+        self._writer.writerow(row)
+        self._fh.flush()
+        self.rows_written += 1
+
+    def close(self):
+        if self._fh is not None:
+            try:
+                self._fh.flush()
+            finally:
+                self._fh.close()
+                self._fh = None

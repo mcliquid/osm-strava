@@ -1,0 +1,44 @@
+# Local environment
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Secrets — never commit Strava session cookies
+.strava-cookie
+
+# Tile and Overpass caches
+cache/
+
+# Local OSM extracts (too large; keep .poly files)
+*.osm
+*.osm.pbf
+osm-data/*.osm
+osm-data/*.osm.pbf
+osm-data/backups/
+osm-data/.osmupdate-temp/
+osm-databackups/
+
+# Detector / diagnostics outputs (regenerated locally)
+diagnostics-*.csv
+diagnostics-*.txt
+diagnostics-*.zip
+analysis-*.csv
+analysis-*.geojson
+joined-accepted.csv
+rule-results.csv
+remaining-*.csv
+remaining-*.geojson
+strava-*.geojson
+output.geojson
+*-stats.json
+test*.geojson
+test*.csv
+test*.json
+
+# MapRoulette challenge exports used for offline validation.
+# Keep them local under validation/; they are research data, not runtime source.
+challenge_*_tasks.csv
+validation/*.csv
+validation/*.geojson
+validation/*.json

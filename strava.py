@@ -21,6 +21,16 @@ from shapely.strtree import STRtree
 import sqlite3
 import signal
 
+from diagnostics import (
+    DiagnosticOsmLookup,
+    DiagnosticWriter,
+    build_diagnostic_row,
+    component_osm_follow_metrics,
+    nearest_ferry_distance_m,
+    should_suppress_ferry,
+    should_suppress_parallel_osm,
+)
+
 
 def print_debug(*args):
     if debug:
@@ -64,6 +74,10 @@ class RunStats:
         self.detections_raw = 0
         self.detections_too_small = 0
         self.detections_accepted = 0
+        self.parallel_osm_suppressed = 0
+        self.ferry_suppressed = 0
+        self.suppression_overlap = 0
+        self.total_suppressed = 0
         self.geojson_features = 0
         self.warnings_total = 0
         self.osm_source = None
@@ -80,6 +94,10 @@ class RunStats:
         self.area = None
         self.output = None
         self.tile = None
+        self.diagnostics_path = None
+        self.diagnostic_rows = 0
+        self.suppress_parallel_osm = False
+        self.suppress_ferry = False
 
     def note_warning(self):
         self.warnings_total += 1
@@ -108,7 +126,7 @@ class RunStats:
         finished = (
             self.finished_at.strftime("%Y-%m-%d %H:%M:%S") if self.finished_at else None
         )
-        return {
+        payload = {
             "status": self.status,
             "area": self.area,
             "tile": self.tile,
@@ -136,6 +154,12 @@ class RunStats:
             "detections_raw": self.detections_raw,
             "detections_too_small": self.detections_too_small,
             "detections_accepted": self.detections_accepted,
+            "parallel_osm_suppressed": self.parallel_osm_suppressed,
+            "ferry_suppressed": self.ferry_suppressed,
+            "suppression_overlap": self.suppression_overlap,
+            "total_suppressed": self.total_suppressed,
+            "suppress_parallel_osm": self.suppress_parallel_osm,
+            "suppress_ferry": self.suppress_ferry,
             "geojson_features": self.geojson_features,
             "warnings_total": self.warnings_total,
             "started": started,
@@ -143,6 +167,10 @@ class RunStats:
             "runtime_seconds": int(round(self.elapsed)),
             "runtime": _format_duration(self.elapsed),
         }
+        if self.diagnostics_path:
+            payload["diagnostics_path"] = self.diagnostics_path
+            payload["diagnostic_rows"] = self.diagnostic_rows
+        return payload
 
     def print_summary(self, stream):
         def line(label, value):
@@ -187,11 +215,27 @@ class RunStats:
         print("", file=stream)
         line("Raw detections", _format_int(self.detections_raw))
         line("Rejected (too small)", _format_int(self.detections_too_small))
-        line("Accepted detections", _format_int(self.detections_accepted))
+        if self.suppress_parallel_osm and self.suppress_ferry:
+            line("Accepted before suppression", _format_int(self.detections_accepted))
+            line("Suppressed parallel to OSM", _format_int(self.parallel_osm_suppressed))
+            line("Suppressed ferry traces", _format_int(self.ferry_suppressed))
+            line("Suppression overlap", _format_int(self.suppression_overlap))
+            line("Total suppressed", _format_int(self.total_suppressed))
+        elif self.suppress_parallel_osm:
+            line("Accepted before parallel suppression", _format_int(self.detections_accepted))
+            line("Suppressed parallel to OSM", _format_int(self.parallel_osm_suppressed))
+        elif self.suppress_ferry:
+            line("Accepted before ferry suppression", _format_int(self.detections_accepted))
+            line("Suppressed ferry traces", _format_int(self.ferry_suppressed))
+        else:
+            line("Accepted detections", _format_int(self.detections_accepted))
         print("", file=stream)
         line("GeoJSON features", _format_int(self.geojson_features))
         if self.output:
             line("Output", self.output)
+        if self.diagnostics_path:
+            line("Diagnostics", self.diagnostics_path)
+            line("Diagnostic rows", _format_int(self.diagnostic_rows))
         print("", file=stream)
         line("Warnings", _format_int(self.warnings_total))
         line("Failed tiles", _format_int(self.tiles_failed))
@@ -205,6 +249,11 @@ class RunStats:
 
 
 run_stats = RunStats()
+collect_diagnostic_osm = False
+diagnostic_writer = None
+diagnostic_osm = None
+suppress_parallel_osm = False
+suppress_ferry = False
 
 
 def count_planned_strava_tiles(polygon_area, xul, yul, xlr, ylr, offset_x, offset_y, step, zoom):
@@ -619,6 +668,10 @@ def osm_tags_match_pairs(pairs):
     return False
 
 
+def _is_construction_pairs(pairs):
+    return _tag_pairs_get(pairs, "highway") == "construction"
+
+
 def _is_area_from_tags(pairs, is_relation):
     area = False
     for k, v in pairs:
@@ -669,14 +722,15 @@ def _merge_outer_rings(member_coords, relation_id):
 
 
 class OsmDrawItem:
-    __slots__ = ("source", "osm_id", "fill_polygon", "coords", "envelope")
+    __slots__ = ("source", "osm_id", "fill_polygon", "coords", "envelope", "tags")
 
-    def __init__(self, source, osm_id, fill_polygon, coords, envelope):
+    def __init__(self, source, osm_id, fill_polygon, coords, envelope, tags=None):
         self.source = source
         self.osm_id = osm_id
         self.fill_polygon = fill_polygon
         self.coords = coords
         self.envelope = envelope
+        self.tags = tags
 
 
 class OsmIndex:
@@ -684,6 +738,7 @@ class OsmIndex:
         self.items = items
         self.n_ways = n_ways
         self.n_relations = n_relations
+        self.construction_items = []
         self._tree = STRtree([item.envelope for item in items])
 
     def query(self, tile_env):
@@ -691,6 +746,12 @@ class OsmIndex:
             return []
         indices = self._tree.query(tile_env, predicate="intersects")
         return [self.items[int(i)] for i in indices]
+
+
+def _item_tags_payload(tags):
+    if not collect_diagnostic_osm:
+        return None
+    return {k: v for k, v in tags}
 
 
 def _draw_items_from_way(osm_id, tags, coords):
@@ -703,25 +764,27 @@ def _draw_items_from_way(osm_id, tags, coords):
         _is_area_from_tags(tags, False),
         coords,
         envelope,
+        _item_tags_payload(tags),
     )]
 
 
 def _draw_items_from_relation(osm_id, tags, way_members):
     items = []
     area = _is_area_from_tags(tags, True)
+    tag_payload = _item_tags_payload(tags)
     if area:
         outer_coords = [coords for role, coords in way_members if role == "outer" and coords]
         for ring in _merge_outer_rings(outer_coords, osm_id):
             envelope = _envelope_from_coords(ring)
             if envelope is None:
                 continue
-            items.append(OsmDrawItem("relation", str(osm_id), True, ring, envelope))
+            items.append(OsmDrawItem("relation", str(osm_id), True, ring, envelope, tag_payload))
     else:
         for _role, coords in way_members:
             envelope = _envelope_from_coords(coords)
             if envelope is None:
                 continue
-            items.append(OsmDrawItem("relation", str(osm_id), False, coords, envelope))
+            items.append(OsmDrawItem("relation", str(osm_id), False, coords, envelope, tag_payload))
     return items
 
 
@@ -1072,9 +1135,12 @@ def load_osm_index_from_xml(osm_path, south, west, north, east):
 
     member_way_ids = set()
     relations = []
+    construction_relations = []
     for _tag, elem in _iterparse_osm_elements(osm_path, ("relation",)):
         pairs = _xml_tag_pairs(elem)
-        if not osm_tags_match_pairs(pairs):
+        is_relevant = osm_tags_match_pairs(pairs)
+        is_construction = collect_diagnostic_osm and _is_construction_pairs(pairs)
+        if not is_relevant and not is_construction:
             continue
         osm_id = elem.attrib.get("id", "")
         members = []
@@ -1084,22 +1150,29 @@ def load_osm_index_from_xml(osm_path, south, west, north, east):
             ref = member.attrib.get("ref", "")
             members.append((ref, member.attrib.get("role", "")))
             member_way_ids.add(ref)
-        relations.append((osm_id, pairs, members))
+        if is_relevant:
+            relations.append((osm_id, pairs, members))
+        elif is_construction:
+            construction_relations.append((osm_id, pairs, members))
 
     needed_node_ids = set()
     matching_ways = {}
     member_way_refs = {}
+    construction_ways = {}
     for _tag, elem in _iterparse_osm_elements(osm_path, ("way",)):
         osm_id = elem.attrib.get("id", "")
         pairs = _xml_tag_pairs(elem)
         node_refs = _way_node_refs(elem)
         matches = osm_tags_match_pairs(pairs)
-        if matches or osm_id in member_way_ids:
+        is_construction = collect_diagnostic_osm and _is_construction_pairs(pairs)
+        if matches or is_construction or osm_id in member_way_ids:
             needed_node_ids.update(node_refs)
         if matches:
             matching_ways[osm_id] = (pairs, node_refs)
         elif osm_id in member_way_ids:
             member_way_refs[osm_id] = node_refs
+        if is_construction and osm_id not in matching_ways:
+            construction_ways[osm_id] = (pairs, node_refs)
 
     node_coords = {}
     for _tag, elem in _iterparse_osm_elements(osm_path, ("node",)):
@@ -1147,6 +1220,35 @@ def load_osm_index_from_xml(osm_path, south, west, north, east):
         relation_records.append((rel_id, tags, way_members))
 
     osm_index = build_osm_index(way_records, relation_records)
+    if collect_diagnostic_osm:
+        construction_items = []
+        for osm_id, pairs, node_refs in (
+            (wid, pdata[0], pdata[1]) for wid, pdata in construction_ways.items()
+        ):
+            coords = way_geom.get(osm_id)
+            if coords is None:
+                coords = refs_to_coords(node_refs)
+            if not coords or not _coords_intersect_bbox(coords, bbox_merc):
+                continue
+            construction_items.extend(_draw_items_from_way(osm_id, pairs, coords))
+        for rel_id, tags, members in construction_relations:
+            way_members = []
+            intersects = False
+            for ref, role in members:
+                coords = way_geom.get(ref)
+                if not coords:
+                    continue
+                if _coords_intersect_bbox(coords, bbox_merc):
+                    intersects = True
+                way_members.append((role, coords))
+            if not intersects or not way_members:
+                continue
+            construction_items.extend(_draw_items_from_relation(rel_id, tags, way_members))
+        osm_index.construction_items = construction_items
+        print_verbose(
+            f"Diagnostic construction objects: {len(construction_items)} "
+            f"(not used for masking)"
+        )
     run_stats.osm_source = f"local XML ({os.path.basename(osm_path)})"
     run_stats.osm_ways = osm_index.n_ways
     run_stats.osm_relations = osm_index.n_relations
@@ -1198,6 +1300,22 @@ def plot_osm_items(items, draw, width, pixel_size):
         plot_line(draw, item.coords, tile_bbox, width, pixel_size)
         plot_circle(draw, item.coords, tile_bbox, width, pixel_size)
 
+
+def setup_diagnostic_osm(loaded_index):
+    global diagnostic_osm
+    need_lookup = (
+        diagnostic_writer is not None or suppress_parallel_osm or suppress_ferry
+    )
+    if not need_lookup or loaded_index is None:
+        diagnostic_osm = None
+        return
+    construction_items = getattr(loaded_index, "construction_items", None) or []
+    diagnostic_osm = DiagnosticOsmLookup(loaded_index.items, construction_items)
+    print_verbose(
+        f"Diagnostic OSM lookup: {len(loaded_index.items)} relevant objects, "
+        f"{len(construction_items)} construction objects"
+    )
+
 # This routine check if a strava heatmap tile contains a way not in OSM
 # ---------------------------------------------------------------------
 def check_strava_tile(polygon_area, x, y, zoom):
@@ -1242,7 +1360,8 @@ def check_strava_tile(polygon_area, x, y, zoom):
 #            draw.rectangle((0,0,511,511), fill=255, outline=255)
 
         # Get bounding box of strava tile in Mercator coordinates
-        (lat_ul_merc, lon_ul_merc, lat_lr_merc, lon_lr_merc) = get_merc_bbox(x, y, zoom)
+        bbox_merc = get_merc_bbox(x, y, zoom)
+        (lat_ul_merc, lon_ul_merc, lat_lr_merc, lon_lr_merc) = bbox_merc
         pixel_size = (lat_ul_merc - lat_lr_merc) / image.size[0]
         print_debug("Pixel size =", pixel_size)
         width = round(distance / pixel_size) * 2 + 1
@@ -1273,17 +1392,75 @@ def check_strava_tile(polygon_area, x, y, zoom):
 
         data = np.array(image)
         tile_had_accepted = False
+        tile_lookup = diagnostic_osm
+        need_component_geometry = diagnostic_writer is not None or suppress_parallel_osm
+        need_lookup = need_component_geometry or suppress_ferry
+        if need_lookup and tile_lookup is None:
+            tile_lookup = DiagnosticOsmLookup(osm_items, [])
+        candidate_index = 0
         # Loop while the lighter pixel in the Strava tile is above the threshold
         while np.max(data) >= threshold:
             maximum = np.max(data)
             max_index = np.unravel_index(np.argmax(data), data.shape)
-            result = reverse_transform(max_index, get_merc_bbox(x, y, zoom), pixel_size)
+            result = reverse_transform(max_index, bbox_merc, pixel_size)
+            heatmap_snapshot = data.copy() if need_component_geometry else None
             size = 0
             size = check_trace_area(data, max_index[0], max_index[1], threshold, min_size, size)
             run_stats.detections_raw += 1
+            written_to_geojson = False
+            suppressed_parallel = False
+            suppressed_ferry_flag = False
             if size > min_size:             # Is the size of the trace larger than the min size ?
                 run_stats.detections_accepted += 1
                 tile_had_accepted = True
+                if suppress_parallel_osm:
+                    try:
+                        follow_metrics = component_osm_follow_metrics(
+                            heatmap_snapshot,
+                            int(max_index[0]),
+                            int(max_index[1]),
+                            threshold,
+                            bbox_merc,
+                            pixel_size,
+                            tile_lookup,
+                        )
+                        suppressed_parallel = should_suppress_parallel_osm(follow_metrics)
+                    except Exception as exc:
+                        print(
+                            f"Warning: parallel-OSM suppression failed: {exc}",
+                            file=sys.stderr,
+                        )
+                        run_stats.note_warning()
+                        suppressed_parallel = False
+                    if suppressed_parallel:
+                        run_stats.parallel_osm_suppressed += 1
+                        print_verbose(
+                            f"Suppressed parallel OSM: "
+                            f"{zoom}/{x}/{y}/{int(max_index[0])}/{int(max_index[1])}"
+                        )
+                if suppress_ferry:
+                    try:
+                        ferry_dist = nearest_ferry_distance_m(
+                            tile_lookup, lon2x(result[0]), lat2y(result[1])
+                        )
+                        suppressed_ferry_flag = should_suppress_ferry(ferry_dist)
+                    except Exception as exc:
+                        print(
+                            f"Warning: ferry suppression failed: {exc}",
+                            file=sys.stderr,
+                        )
+                        run_stats.note_warning()
+                        suppressed_ferry_flag = False
+                    if suppressed_ferry_flag:
+                        run_stats.ferry_suppressed += 1
+                        print_verbose(
+                            f"Suppressed ferry: "
+                            f"{zoom}/{x}/{y}/{int(max_index[0])}/{int(max_index[1])}"
+                        )
+                if suppressed_parallel and suppressed_ferry_flag:
+                    run_stats.suppression_overlap += 1
+                if suppressed_parallel or suppressed_ferry_flag:
+                    run_stats.total_suppressed += 1
                 # print(f"geo:{result[1]},{result[0]}?z={zoom}")
                 print_verbose(f"https://www.openstreetmap.org/?mlat={result[1]}&"
                               f"mlon={result[0]}#map={zoom}/{result[1]}/{result[0]}&layers=N")
@@ -1303,17 +1480,32 @@ def check_strava_tile(polygon_area, x, y, zoom):
                           f" but it seems it is not: {res[2][21:-2]}/inspect", file=sys.stderr)
                     run_stats.note_warning()
 
-                if status != "Too_Hard" and status != "Not_an_Issue":
+                if (
+                    not suppressed_parallel
+                    and not suppressed_ferry_flag
+                    and status != "Too_Hard"
+                    and status != "Not_an_Issue"
+                ):
                     run_stats.geojson_features += 1
+                    written_to_geojson = True
                     # print GEOJSON line for MapRoulette
                     RS = chr(30)  # Record Separator ASCII control character
-                    print(f'{RS}{{"type":"FeatureCollection","features":[{{"type":"Feature",'
-                          f'"geometry":{{"type":"Point","coordinates":[{result[0]}, {result[1]}]}},'
-                          f'"properties":{{"id":"{id}","longitude":"{result[0]}",'
-                          f'"latitude":"{result[1]}","distance":"{distance}",'
-                          f'"threshold":"{threshold}","maximum":"{maximum}",'
-                          f'"min_size":"{min_size}","size":"{size}"}}}}],'
-                          f'"id":"{id}"}}', file=geojson_file)
+                    if diagnostic_writer is not None:
+                        print(f'{RS}{{"type":"FeatureCollection","features":[{{"type":"Feature",'
+                              f'"geometry":{{"type":"Point","coordinates":[{result[0]}, {result[1]}]}},'
+                              f'"properties":{{"id":"{id}","candidate_id":"{id}","longitude":"{result[0]}",'
+                              f'"latitude":"{result[1]}","distance":"{distance}",'
+                              f'"threshold":"{threshold}","maximum":"{maximum}",'
+                              f'"min_size":"{min_size}","size":"{size}"}}}}],'
+                              f'"id":"{id}"}}', file=geojson_file)
+                    else:
+                        print(f'{RS}{{"type":"FeatureCollection","features":[{{"type":"Feature",'
+                              f'"geometry":{{"type":"Point","coordinates":[{result[0]}, {result[1]}]}},'
+                              f'"properties":{{"id":"{id}","longitude":"{result[0]}",'
+                              f'"latitude":"{result[1]}","distance":"{distance}",'
+                              f'"threshold":"{threshold}","maximum":"{maximum}",'
+                              f'"min_size":"{min_size}","size":"{size}"}}}}],'
+                              f'"id":"{id}"}}', file=geojson_file)
 
                 # Flood fill to disable the area of the issue that has been found
                 if debug:
@@ -1325,6 +1517,36 @@ def check_strava_tile(polygon_area, x, y, zoom):
                     image.save(f"after_flood_{zoom}_{x}_{y}.png")  # For debugging
             else:
                 run_stats.detections_too_small += 1
+            if diagnostic_writer is not None:
+                try:
+                    row = build_diagnostic_row(
+                        zoom=zoom,
+                        tile_x=x,
+                        tile_y=y,
+                        candidate_index=candidate_index,
+                        peak_row=int(max_index[0]),
+                        peak_col=int(max_index[1]),
+                        center_lon=result[0],
+                        center_lat=result[1],
+                        pixel_size_m=pixel_size,
+                        heatmap_snapshot=heatmap_snapshot,
+                        threshold=threshold,
+                        lookup=tile_lookup,
+                        lon2x=lon2x,
+                        lat2y=lat2y,
+                        too_small=size <= min_size,
+                        accepted=size > min_size,
+                        written_to_geojson=written_to_geojson,
+                        bbox_merc=bbox_merc,
+                        suppressed_parallel_osm=suppressed_parallel,
+                        suppressed_ferry=suppressed_ferry_flag,
+                    )
+                    diagnostic_writer.write_row(row)
+                    run_stats.diagnostic_rows = diagnostic_writer.rows_written
+                except Exception as exc:
+                    print(f"Warning: diagnostics row failed: {exc}", file=sys.stderr)
+                    run_stats.note_warning()
+            candidate_index += 1
         if tile_had_accepted:
             run_stats.tiles_with_detection += 1
 
@@ -1386,6 +1608,28 @@ parser.add_argument(
     metavar="FILE",
     help="Write run statistics as JSON to FILE",
 )
+parser.add_argument(
+    "--diagnostics",
+    metavar="FILE",
+    help="Write per-candidate diagnostic CSV for calibration (does not change detection)",
+)
+parser.add_argument(
+    "--suppress-parallel-osm",
+    action="store_true",
+    help=(
+        "Opt-in: omit accepted candidates whose heatmap component follows local OSM "
+        "(follow100>=0.70 and parallel15>=0.70). Default off; does not change masking "
+        "or detection thresholds."
+    ),
+)
+parser.add_argument(
+    "--suppress-ferry",
+    action="store_true",
+    help=(
+        "Opt-in: omit accepted candidates whose peak is within 500 m of a route=ferry "
+        "object. Default off; candidate-level only, does not widen the OSM mask buffer."
+    ),
+)
 
 args = parser.parse_args()
 
@@ -1432,6 +1676,19 @@ if args.area:
 if args.x is not None and args.y is not None:
     run_stats.tile = f"{zoom}/{args.x}/{args.y}"
 run_stats.output = args.geojson
+if args.diagnostics:
+    collect_diagnostic_osm = True
+    diagnostic_writer = DiagnosticWriter(args.diagnostics)
+    run_stats.diagnostics_path = args.diagnostics
+    print_verbose("Diagnostics =", args.diagnostics)
+suppress_parallel_osm = bool(args.suppress_parallel_osm)
+run_stats.suppress_parallel_osm = suppress_parallel_osm
+if suppress_parallel_osm:
+    print_verbose("Suppress parallel OSM = on (follow100>=0.70 and parallel15>=0.70)")
+suppress_ferry = bool(args.suppress_ferry)
+run_stats.suppress_ferry = suppress_ferry
+if suppress_ferry:
+    print_verbose("Suppress ferry = on (nearest_ferry_distance_m<=500)")
 
 # Create output file
 if args.geojson is not None:
@@ -1478,6 +1735,7 @@ try:
             osm_index = load_osm_index_from_xml(
                 args.osm_file, osm_south, osm_west, osm_north, osm_east
             )
+            setup_diagnostic_osm(osm_index)
         run_stats.tiles_total = 1
         check_strava_tile(None, x, y, zoom)
     else:
@@ -1497,6 +1755,7 @@ try:
             osm_index = load_area_osm_index(
                 args.area, osm_south, osm_west, osm_north, osm_east, args.refresh_osm
             )
+        setup_diagnostic_osm(osm_index)
 
         if not verbose and not debug and args.geojson is not None and not args.quiet:
             progress = True
@@ -1545,6 +1804,12 @@ except Exception:
     run_stats.exit_code = 1
     raise
 finally:
+    if diagnostic_writer is not None:
+        try:
+            diagnostic_writer.close()
+            run_stats.diagnostic_rows = diagnostic_writer.rows_written
+        except Exception:
+            pass
     if args.geojson is not None:
         try:
             geojson_file.close()
