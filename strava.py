@@ -16,7 +16,9 @@ from PIL import Image, ImageDraw
 import numpy as np
 import xml.etree.ElementTree as ET
 from shapely.geometry.polygon import Polygon
-from shapely.geometry import box, shape, GeometryCollection
+from shapely.geometry import box, shape, Point
+from shapely.ops import unary_union
+from shapely.prepared import prep
 from shapely.strtree import STRtree
 import sqlite3
 import signal
@@ -73,6 +75,7 @@ class RunStats:
         self.strava_retries = 0
         self.detections_raw = 0
         self.detections_too_small = 0
+        self.detections_outside_area = 0
         self.detections_accepted = 0
         self.parallel_osm_suppressed = 0
         self.ferry_suppressed = 0
@@ -153,6 +156,7 @@ class RunStats:
             "strava_retries": self.strava_retries,
             "detections_raw": self.detections_raw,
             "detections_too_small": self.detections_too_small,
+            "detections_outside_area": self.detections_outside_area,
             "detections_accepted": self.detections_accepted,
             "parallel_osm_suppressed": self.parallel_osm_suppressed,
             "ferry_suppressed": self.ferry_suppressed,
@@ -215,6 +219,7 @@ class RunStats:
         print("", file=stream)
         line("Raw detections", _format_int(self.detections_raw))
         line("Rejected (too small)", _format_int(self.detections_too_small))
+        line("Rejected (outside area)", _format_int(self.detections_outside_area))
         if self.suppress_parallel_osm and self.suppress_ferry:
             line("Accepted before suppression", _format_int(self.detections_accepted))
             line("Suppressed parallel to OSM", _format_int(self.parallel_osm_suppressed))
@@ -254,6 +259,8 @@ diagnostic_writer = None
 diagnostic_osm = None
 suppress_parallel_osm = False
 suppress_ferry = False
+requested_area = None
+requested_area_prepared = None
 
 
 def count_planned_strava_tiles(polygon_area, xul, yul, xlr, ylr, offset_x, offset_y, step, zoom):
@@ -343,6 +350,7 @@ def _overpass_value_regex(values):
 
 _OVERPASS_FILTER = (
     f'(nwr[highway~"{_overpass_value_regex(_OSM_HIGHWAY_VALUES)}"];'
+    'nwr[highway=construction];'
     f'nwr["area:highway"~"{_overpass_value_regex(_OSM_HIGHWAY_VALUES)}"];'
     'nwr[railway];'
     f'nwr[aeroway~"{_overpass_value_regex(_OSM_AEROWAY_VALUES)}"];'
@@ -651,7 +659,13 @@ def _tag_pairs_has_key(pairs, key):
 
 
 def osm_tags_match_pairs(pairs):
-    if _tag_pairs_get(pairs, "highway") in _OSM_HIGHWAY_SET:
+    highway = _tag_pairs_get(pairs, "highway")
+    if highway in _OSM_HIGHWAY_SET:
+        return True
+    # osm-strava detects missing geometry. highway=construction is already
+    # mapped OSM geometry, so it is masked at the normal distance (default 35 m).
+    # This is not a suppression rule and does not include highway=proposed.
+    if highway == "construction":
         return True
     if _tag_pairs_get(pairs, "area:highway") in _OSM_HIGHWAY_SET:
         return True
@@ -1152,7 +1166,7 @@ def load_osm_index_from_xml(osm_path, south, west, north, east):
             member_way_ids.add(ref)
         if is_relevant:
             relations.append((osm_id, pairs, members))
-        elif is_construction:
+        if is_construction:
             construction_relations.append((osm_id, pairs, members))
 
     needed_node_ids = set()
@@ -1171,7 +1185,7 @@ def load_osm_index_from_xml(osm_path, south, west, north, east):
             matching_ways[osm_id] = (pairs, node_refs)
         elif osm_id in member_way_ids:
             member_way_refs[osm_id] = node_refs
-        if is_construction and osm_id not in matching_ways:
+        if is_construction:
             construction_ways[osm_id] = (pairs, node_refs)
 
     node_coords = {}
@@ -1247,7 +1261,7 @@ def load_osm_index_from_xml(osm_path, south, west, north, east):
         osm_index.construction_items = construction_items
         print_verbose(
             f"Diagnostic construction objects: {len(construction_items)} "
-            f"(not used for masking)"
+            f"(highway=construction is also masked as existing OSM geometry)"
         )
     run_stats.osm_source = f"local XML ({os.path.basename(osm_path)})"
     run_stats.osm_ways = osm_index.n_ways
@@ -1285,11 +1299,63 @@ def osm_bbox_for_tile(tile_x, tile_y, zoom, distance):
     )
 
 
+def _polygonal_parts(geom):
+    if geom is None or geom.is_empty:
+        return []
+    gtype = geom.geom_type
+    if gtype == "Polygon":
+        return [geom]
+    if gtype == "MultiPolygon":
+        return list(geom.geoms)
+    if gtype == "GeometryCollection":
+        parts = []
+        for part in geom.geoms:
+            parts.extend(_polygonal_parts(part))
+        return parts
+    return []
+
+
 def load_area_polygon(area_path):
-    # buffer(0) is a trick for fixing polygons with overlapping coordinates
+    # The GeoJSON polygon/multipolygon is authoritative for candidate inclusion.
+    # Holes are preserved. Do not approximate this with a bounding box.
     with open(area_path, encoding="utf-8") as f:
-        features = json.load(f)["features"]
-    return GeometryCollection([shape(feature["geometry"]).buffer(0) for feature in features])
+        payload = json.load(f)
+    features = []
+    payload_type = payload.get("type")
+    if payload_type == "FeatureCollection":
+        features = payload.get("features") or []
+    elif payload_type == "Feature":
+        features = [payload]
+    else:
+        features = [{"geometry": payload}]
+    geoms = []
+    for feature in features:
+        geometry = feature.get("geometry") if isinstance(feature, dict) else None
+        if geometry is None:
+            continue
+        geom = shape(geometry).buffer(0)
+        geoms.extend(_polygonal_parts(geom))
+    if not geoms:
+        raise ValueError(f"No polygon/multipolygon geometry in {area_path}")
+    merged = unary_union(geoms)
+    polygonal = _polygonal_parts(merged)
+    if not polygonal:
+        raise ValueError(f"No polygon/multipolygon geometry in {area_path}")
+    return unary_union(polygonal) if len(polygonal) > 1 else polygonal[0]
+
+
+def set_requested_area(geom):
+    global requested_area, requested_area_prepared
+    requested_area = geom
+    requested_area_prepared = prep(geom) if geom is not None else None
+
+
+def candidate_inside_requested_area(lon, lat):
+    # covers() keeps a point exactly on the polygon boundary.
+    # Without -a (single-tile debug), every candidate is treated as in-area.
+    if requested_area_prepared is None:
+        return True
+    return bool(requested_area_prepared.covers(Point(lon, lat)))
 
 
 def plot_osm_items(items, draw, width, pixel_size):
@@ -1410,7 +1476,20 @@ def check_strava_tile(polygon_area, x, y, zoom):
             written_to_geojson = False
             suppressed_parallel = False
             suppressed_ferry_flag = False
-            if size > min_size:             # Is the size of the trace larger than the min size ?
+            too_small = size <= min_size
+            inside_area = candidate_inside_requested_area(result[0], result[1])
+            accepted = (not too_small) and inside_area
+            if too_small:
+                run_stats.detections_too_small += 1
+            elif not inside_area:
+                run_stats.detections_outside_area += 1
+                print_verbose(
+                    f"Rejected outside area: "
+                    f"{zoom}/{x}/{y}/{int(max_index[0])}/{int(max_index[1])}"
+                )
+            else:
+                # Accepted: passed size AND requested-area tests.
+                # Suppression runs only on accepted in-area candidates.
                 run_stats.detections_accepted += 1
                 tile_had_accepted = True
                 if suppress_parallel_osm:
@@ -1507,7 +1586,9 @@ def check_strava_tile(polygon_area, x, y, zoom):
                               f'"min_size":"{min_size}","size":"{size}"}}}}],'
                               f'"id":"{id}"}}', file=geojson_file)
 
-                # Flood fill to disable the area of the issue that has been found
+            if not too_small:
+                # Flood fill to disable the leftover heatmap component, including
+                # large traces rejected only because they lie outside the area.
                 if debug:
                     image.save(f"before_flood_{zoom}_{x}_{y}.png")  # For debugging
                 print_debug(x, y, max_index, maximum)
@@ -1515,8 +1596,6 @@ def check_strava_tile(polygon_area, x, y, zoom):
                 data = np.array(image)
                 if debug:
                     image.save(f"after_flood_{zoom}_{x}_{y}.png")  # For debugging
-            else:
-                run_stats.detections_too_small += 1
             if diagnostic_writer is not None:
                 try:
                     row = build_diagnostic_row(
@@ -1534,8 +1613,9 @@ def check_strava_tile(polygon_area, x, y, zoom):
                         lookup=tile_lookup,
                         lon2x=lon2x,
                         lat2y=lat2y,
-                        too_small=size <= min_size,
-                        accepted=size > min_size,
+                        too_small=too_small,
+                        accepted=accepted,
+                        inside_area=inside_area,
                         written_to_geojson=written_to_geojson,
                         bbox_merc=bbox_merc,
                         suppressed_parallel_osm=suppressed_parallel,
@@ -1555,7 +1635,11 @@ def check_strava_tile(polygon_area, x, y, zoom):
 # ----------------------------
 parser = argparse.ArgumentParser()
 
-parser.add_argument("-a", "--area", help="Area of interest (GeoJSON)")
+parser.add_argument(
+    "-a", "--area",
+    help="Area of interest (GeoJSON polygon/multipolygon). Tiles that intersect "
+         "the area are processed; only candidate points inside the polygon are emitted.",
+)
 parser.add_argument("-m", "--minlevel", type=int, default=100,
                     help="Minimum Strava level (0-255)")
 parser.add_argument("-d", "--distance", type=int, default=35,
@@ -1721,9 +1805,12 @@ try:
     if args.x is not None and args.y is not None:
         x = args.x
         y = args.y
+        polygon_area = None
+        if args.area is not None:
+            polygon_area = load_area_polygon(args.area)
+            set_requested_area(polygon_area)
         if args.osm_file:
-            if args.area is not None:
-                polygon_area = load_area_polygon(args.area)
+            if polygon_area is not None:
                 _range, osm_bbox = compute_area_tile_range_and_osm_bbox(
                     polygon_area.bounds, zoom, distance
                 )
@@ -1739,8 +1826,10 @@ try:
         run_stats.tiles_total = 1
         check_strava_tile(None, x, y, zoom)
     else:
-        # Get polygon of area
+        # Get polygon of area. Tiles may cross the boundary; candidate points
+        # are later tested against this geometry, not the bounding box.
         polygon_area = load_area_polygon(args.area)
+        set_requested_area(polygon_area)
         bbox_area = polygon_area.bounds
         print_verbose("Area bounding box:", bbox_area)
 

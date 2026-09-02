@@ -75,6 +75,7 @@ DIAGNOSTIC_COLUMNS = [
     "raw_candidate",
     "too_small",
     "accepted",
+    "inside_area",
     "written_to_geojson",
     "suppressed_parallel_osm",
     "suppressed_ferry",
@@ -597,6 +598,7 @@ def build_diagnostic_row(
     bbox_merc=None,
     suppressed_parallel_osm=False,
     suppressed_ferry=False,
+    inside_area=True,
 ):
     candidate_id = f"{zoom}/{tile_x}/{tile_y}/{peak_row}/{peak_col}"
     values, rows, cols = extract_component_pixels(
@@ -664,6 +666,7 @@ def build_diagnostic_row(
     row["raw_candidate"] = _bool_csv(True)
     row["too_small"] = _bool_csv(too_small)
     row["accepted"] = _bool_csv(accepted)
+    row["inside_area"] = _bool_csv(inside_area)
     row["written_to_geojson"] = _bool_csv(written_to_geojson)
     row["suppressed_parallel_osm"] = _bool_csv(suppressed_parallel_osm)
     row["suppressed_ferry"] = _bool_csv(suppressed_ferry)

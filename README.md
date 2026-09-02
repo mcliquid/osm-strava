@@ -6,7 +6,17 @@ tiles and write a GeoJSON file suitable for a
 
 The detector compares heatmap traces against a local OSM extract (or Overpass),
 masks pixels that already follow OSM objects, and emits point tasks for leftover
-traces that pass size and intensity checks.
+traces that pass size, intensity, and requested-area checks.
+
+The GeoJSON given to `-a` is authoritative for **candidate inclusion**. Tiles that
+cross the boundary are still processed, but a candidate point outside the polygon
+(including holes) is not accepted and is not written to GeoJSON. Boundary points
+are kept.
+
+`highway=construction` is treated as **existing mapped geometry** and is masked at
+the normal OSM distance (default 35 m). osm-strava detects missing geometry; a
+construction way is already mapped. This is not a suppression rule and does not
+include `highway=proposed`.
 
 License: [GNU GPL v3](LICENSE).
 
@@ -32,8 +42,10 @@ Last measured Mallorca snapshot (same OSM extract, no task database):
 | `--suppress-ferry` | 189 | 175 |
 | both flags | 189 | 54 |
 
-`accepted` means the candidate passed the normal detector. Optional suppression
-may omit it from GeoJSON afterwards; diagnostics still record `accepted=true`.
+`accepted` means the candidate passed the normal detector (size and requested-area
+tests). Optional suppression may omit it from GeoJSON afterwards; diagnostics
+still record `accepted=true`. The Mallorca counts below predate the area-boundary
+and `highway=construction` masking fixes and may change on a rerun.
 
 ## Requirements
 
@@ -114,14 +126,14 @@ From `strava.py --help` (defaults in parentheses):
 
 | Option | Meaning |
 |---|---|
-| `-a` / `--area` | Area GeoJSON (multipolygon / feature collection) |
+| `-a` / `--area` | Area GeoJSON (polygon/multipolygon). Tiles may overlap the boundary; only in-area candidate points are emitted |
 | `-x` / `-y` | Single Strava tile coordinates (debug; both required) |
 | `-c` / `--activity` | Activity (`run` default). Direct Strava tiles: `ride` only |
 | `--strava-tiles` | `freemap` (default), `nakarte`, or `strava` |
 | `-z` / `--zoom` | Tile zoom 10–15 (`15` default). Mallorca uses `14` |
 | `-m` / `--minlevel` | Intensity threshold 0–255 (`100`) |
 | `-s` / `--size` | Minimum component size in pixels (`20`) |
-| `-d` / `--distance` | OSM mask buffer in metres (`35`) |
+| `-d` / `--distance` | OSM mask buffer in metres (`35`). Includes `highway=construction` |
 | `-g` / `--geojson` | Output GeoJSON (GeoJSONSeq with RS). stdout if omitted |
 | `-o` / `--offset` | Tile offset 0–3 (skip contiguous tiles; see workflow) |
 | `-b` / `--tasks_db` | Read-only SQLite of already processed MapRoulette tasks |
@@ -137,15 +149,16 @@ From `strava.py --help` (defaults in parentheses):
 | `--suppress-ferry` | Opt-in ferry-candidate suppression (default off) |
 
 Area polygons can be downloaded from [OSM-Boundaries](https://osm-boundaries.com/).
-Example files live in `boundaries/`.
+Example files live in `boundaries/`. Candidate output is clipped to the polygon
+itself, not its bounding box.
 
 The intensity colour scale is shown in `docs/palette.png`.
 
 ## Optional suppression
 
-Both flags are **opt-in** and default **off**. They run after normal detection.
-Flood-fill and task IDs are unchanged. A candidate can match both rules; it is
-counted once in the GeoJSON union.
+Both flags are **opt-in** and default **off**. They run after normal detection
+on accepted in-area candidates only. Flood-fill and task IDs are unchanged. A
+candidate can match both rules; it is counted once in the GeoJSON union.
 
 ### `--suppress-parallel-osm`
 
@@ -183,7 +196,8 @@ Summary fields:
 
 - raw detections
 - rejected (too small)
-- accepted (before optional suppression)
+- rejected (outside area)
+- accepted (passed size and requested-area tests; before optional suppression)
 - suppressed parallel to OSM
 - suppressed ferry traces
 - suppression overlap
@@ -239,6 +253,7 @@ Main diagnostic groups (not a full column list):
 - nearest OSM object and distances
 - nearest ferry / construction
 - follow / parallel geometry vs local OSM
+- area membership (`inside_area`)
 - suppression status (`suppressed_parallel_osm`, `suppressed_ferry`, `written_to_geojson`)
 
 Generated analysis CSV/GeoJSON files are gitignored.
