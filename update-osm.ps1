@@ -3,6 +3,8 @@
 #
 #   .\update-osm.ps1 mallorca
 #   .\update-osm.ps1 bodenseekreis
+#   .\update-osm.ps1 mallorca --fresh
+#   .\update-osm.ps1 mallorca --fresh --bootstrap
 #   .\update-osm.ps1 --list
 #   .\update-osm.ps1 --show-config mallorca
 #

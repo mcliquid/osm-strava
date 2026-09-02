@@ -4,9 +4,12 @@
 #
 #   ./update-osm.sh mallorca
 #   ./update-osm.sh bodenseekreis
+#   ./update-osm.sh mallorca --fresh
 #
-# Derived PBF/XML are replaced only after validation. A failed run keeps
-# the previous known-good detector files.
+# Default mode uses the Geofabrik daily extract. --fresh applies official
+# planet.openstreetmap.org replication to an unclipped working copy of that
+# extract, then still clips with osmium extract --strategy=complete_ways.
+# Never pass osmupdate -B: clipping diffs reintroduces missing node refs.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -21,9 +24,12 @@ SIZE_WARN_FACTOR="1.5"
 SIZE_FAIL_FACTOR="3.0"
 
 FORCE=0
+FRESH=0
+BOOTSTRAP=0
 SHOW_CONFIG=0
 LIST_ONLY=0
 REGION_ID=""
+UPDATE_MODE="geofabrik"
 
 STATUS="FAILED"
 SOURCE_STATUS="FAILED"
@@ -55,10 +61,15 @@ SOURCE_META=""
 STAMP_FILE=""
 BACKUP_DIR=""
 SOURCE_TMP=""
+WORKING_PBF=""
+WORKING_TMP=""
+OSMUPDATE_TEMP=""
+EXTRACT_INPUT_PBF=""
 EXTRACT_TMP=""
 XML_TMP=""
 CHECKREFS_LOG=""
 CLEANUP_SOURCE_TMP=1
+CLEANUP_WORKING_TMP=1
 CLEANUP_EXTRACT_TMP=1
 CLEANUP_XML_TMP=1
 
@@ -83,22 +94,34 @@ AFTER_RELS=0
 AFTER_DATA_TS_FIRST=""
 AFTER_DATA_TS_LAST=""
 XML_TS=""
+FRESH_START_TS=""
+FRESH_AFTER_TS=""
+FRESH_DIFFS=""
+PLANET_TS=""
+REPLICATION_NOTE="Geofabrik, not minutely"
+WORKING_STATE=""
 
 usage() {
   cat <<'EOF'
 Usage:
   update-osm.sh <region> [--force]
+  update-osm.sh <region> --fresh [--bootstrap] [--force]
   update-osm.sh --show-config <region>
   update-osm.sh --list
   update-osm.sh --help
 
-Refresh a detector OSM extract from Geofabrik and clip it with
+Refresh a detector OSM extract and clip it with
 osmium extract --strategy=complete_ways.
 
 Regions are defined in osm-regions.conf.
 
-  --force   Rebuild the regional extract and XML even if the Geofabrik
-            source and boundary file have not changed.
+  --force       Rebuild the regional extract and XML even if the source
+                and boundary file have not changed.
+  --fresh       Opt-in: advance an unclipped working copy of the Geofabrik
+                source with planet.openstreetmap.org replication, then
+                extract. Default remains Geofabrik-daily.
+  --bootstrap   With --fresh, replace the working copy from Geofabrik
+                before applying replication.
 EOF
 }
 
@@ -156,6 +179,7 @@ print_summary() {
   echo "------------------------------------------------------------"
   echo "Status:              ${STATUS}"
   echo "Region:              ${REGION_ID:-unknown}"
+  echo "Update mode:         ${UPDATE_MODE}"
   echo "Source status:       ${SOURCE_STATUS}"
   echo "Extract status:      ${EXTRACT_STATUS}"
   echo "XML status:          ${XML_STATUS}"
@@ -165,14 +189,37 @@ print_summary() {
   if [[ "$STATUS" != "SUCCESS" ]]; then
     echo "Known-good detector files were NOT replaced."
   fi
-  if [[ -n "$AFTER_TS" ]]; then
-    echo "Source timestamp:    ${AFTER_TS}"
-    local now_epoch after_epoch lag
+  if [[ -n "$FRESH_START_TS" ]]; then
+    echo "Replication start:   ${FRESH_START_TS}"
+  fi
+  if [[ -n "$FRESH_AFTER_TS" ]]; then
+    echo "Replication result:  ${FRESH_AFTER_TS}"
+  fi
+  if [[ -n "$PLANET_TS" ]]; then
+    echo "Planet minutely:     ${PLANET_TS}"
+  fi
+  local lag_ts="${FRESH_AFTER_TS:-$AFTER_TS}"
+  if [[ -n "$lag_ts" ]]; then
+    echo "Source timestamp:    ${lag_ts}"
+    local now_epoch after_epoch lag live_epoch live_lag
     now_epoch="$(date -u +%s)"
-    if after_epoch="$(ts_to_epoch "$AFTER_TS" 2>/dev/null)"; then
+    if after_epoch="$(ts_to_epoch "$lag_ts" 2>/dev/null)"; then
       lag=$((now_epoch - after_epoch))
-      echo "Source lag:          $(format_hms "$lag") (Geofabrik, not minutely)"
+      echo "Source lag:          $(format_hms "$lag") (${REPLICATION_NOTE})"
+      if [[ -n "$PLANET_TS" ]] && live_epoch="$(ts_to_epoch "$PLANET_TS" 2>/dev/null)"; then
+        live_lag=$((live_epoch - after_epoch))
+        if (( live_lag < 0 )); then
+          live_lag=0
+        fi
+        echo "Lag behind planet:   $(format_hms "$live_lag")"
+      fi
     fi
+  fi
+  if [[ -n "$FRESH_DIFFS" ]]; then
+    echo "Replication diffs:   ${FRESH_DIFFS}"
+  fi
+  if [[ "$UPDATE_MODE" == "fresh" && -n "$WORKING_PBF" && -f "$WORKING_PBF" ]]; then
+    echo "Working PBF:         $(relpath "$WORKING_PBF")"
   fi
   if (( SOURCE_SIZE > 0 )); then
     echo "Source PBF size:     $(format_mib "$SOURCE_SIZE")"
@@ -220,6 +267,9 @@ on_exit() {
   local rc=$?
   if [[ "$CLEANUP_SOURCE_TMP" -eq 1 && -n "$SOURCE_TMP" && -f "$SOURCE_TMP" ]]; then
     rm -f "$SOURCE_TMP"
+  fi
+  if [[ "$CLEANUP_WORKING_TMP" -eq 1 && -n "$WORKING_TMP" && -f "$WORKING_TMP" ]]; then
+    rm -f "$WORKING_TMP"
   fi
   if [[ "$CLEANUP_EXTRACT_TMP" -eq 1 && -n "$EXTRACT_TMP" && -f "$EXTRACT_TMP" ]]; then
     rm -f "$EXTRACT_TMP"
@@ -338,6 +388,10 @@ print_region_config() {
   echo "Extract PBF:       $(relpath "$EXTRACT_PBF")"
   echo "Extract XML:       $(relpath "$EXTRACT_XML")"
   echo "Extract strategy:  ${EXTRACT_STRATEGY}"
+  echo "Update mode:       ${UPDATE_MODE}"
+  if [[ -n "$WORKING_PBF" ]]; then
+    echo "Working PBF:       $(relpath "$WORKING_PBF")"
+  fi
   echo "Safety bbox:       lon ${BBOX_LON_MIN}..${BBOX_LON_MAX}, lat ${BBOX_LAT_MIN}..${BBOX_LAT_MAX} (requested boundary, not complete_ways nodes)"
   echo "Source size range: $(format_mib "$SOURCE_MIN_BYTES") .. $(format_mib "$SOURCE_MAX_BYTES")"
   echo "Min objects:       nodes>=$(format_int "$MIN_NODES") ways>=$(format_int "$MIN_WAYS") relations>=$(format_int "$MIN_RELS")"
@@ -554,44 +608,112 @@ url='${GEOFABRIK_URL}'
 EOF
 }
 
+parse_http_headers_file() {
+  python3 - "$1" <<'PY'
+import re, sys
+raw = open(sys.argv[1], encoding="utf-8", errors="replace").read().replace("\r", "")
+headers = {}
+# curl -I writes blank-line separated HTTP responses. wget -S prefixes
+# header lines with two spaces and interleaves progress text.
+blocks = []
+current = []
+for line in raw.splitlines():
+    stripped = line.strip()
+    if re.match(r"HTTP/\d", stripped):
+        if current:
+            blocks.append(current)
+        current = [stripped]
+        continue
+    if stripped == "":
+        if current:
+            blocks.append(current)
+            current = []
+        continue
+    if current is not None and ":" in stripped:
+        current.append(stripped)
+if current:
+    blocks.append(current)
+chosen = None
+for block in reversed(blocks):
+    status = block[0]
+    if re.search(r"\s200\b", status):
+        chosen = block
+        break
+if chosen is None and blocks:
+    chosen = blocks[-1]
+if not chosen:
+    sys.exit(2)
+parsed = {}
+for line in chosen[1:]:
+    key, value = line.split(":", 1)
+    parsed[key.strip().lower()] = value.strip()
+print("REMOTE_ETAG=" + repr(parsed.get("etag", "")))
+print("REMOTE_LAST_MODIFIED=" + repr(parsed.get("last-modified", "")))
+print("REMOTE_LENGTH=" + repr(parsed.get("content-length", "")))
+PY
+}
+
 fetch_remote_headers() {
-  local headers parsed
+  local headers parsed wget_out
   REMOTE_ETAG=""
   REMOTE_LAST_MODIFIED=""
   REMOTE_LENGTH=""
   headers="$(mktemp)"
-  if ! curl -sI -L --max-time 30 -A "osm-strava-update/1.0" -o "$headers" "$GEOFABRIK_URL"; then
-    rm -f "$headers"
-    fail "Could not fetch HTTP headers from ${GEOFABRIK_URL}"
+  wget_out="$(mktemp)"
+  parsed=""
+  if curl -sI -L --connect-timeout 15 --max-time 45 --retry 2 --retry-delay 2 \
+      -A "osm-strava-update/1.0" -o "$headers" "$GEOFABRIK_URL" \
+      && [[ -s "$headers" ]]; then
+    parsed="$(parse_http_headers_file "$headers" || true)"
   fi
-  parsed="$(
-    python3 - "$headers" <<'PY'
-import sys
-raw = open(sys.argv[1], encoding="utf-8", errors="replace").read().replace("\r", "")
-blocks = [b for b in raw.split("\n\n") if b.strip()]
-if not blocks:
-    sys.exit(2)
-headers = {}
-for line in blocks[-1].splitlines():
-    if ":" not in line:
-        continue
-    key, value = line.split(":", 1)
-    headers[key.strip().lower()] = value.strip()
-print("REMOTE_ETAG=" + repr(headers.get("etag", "")))
-print("REMOTE_LAST_MODIFIED=" + repr(headers.get("last-modified", "")))
-print("REMOTE_LENGTH=" + repr(headers.get("content-length", "")))
-PY
-  )" || {
-    rm -f "$headers"
-    fail "Could not parse HTTP headers from ${GEOFABRIK_URL}"
-  }
-  rm -f "$headers"
+  if [[ -z "$parsed" ]]; then
+    echo "WARNING: curl HEAD failed; retrying Geofabrik with wget --spider" >&2
+    if wget -S --spider --timeout=45 --tries=2 -U "osm-strava-update/1.0" \
+        "$GEOFABRIK_URL" >"$wget_out" 2>&1; then
+      parsed="$(parse_http_headers_file "$wget_out" || true)"
+    fi
+  fi
+  rm -f "$headers" "$wget_out"
+  if [[ -z "$parsed" ]]; then
+    return 1
+  fi
   eval "$parsed"
   echo "Remote Last-Modified: ${REMOTE_LAST_MODIFIED:-unknown}"
   echo "Remote ETag:          ${REMOTE_ETAG:-unknown}"
   if [[ -n "$REMOTE_LENGTH" ]]; then
     echo "Remote Content-Length: $(format_int "$REMOTE_LENGTH") bytes"
   fi
+  return 0
+}
+
+fetch_planet_minutely_timestamp() {
+  local state
+  PLANET_TS=""
+  state="$(mktemp)"
+  if ! curl -fsL --connect-timeout 15 --max-time 30 --retry 2 --retry-delay 2 \
+      -A "osm-strava-update/1.0" \
+      -o "$state" "https://planet.openstreetmap.org/replication/minute/state.txt"; then
+    rm -f "$state"
+    echo "WARNING: could not read planet.openstreetmap.org minutely state.txt" >&2
+    return 1
+  fi
+  PLANET_TS="$(
+    python3 - "$state" <<'PY'
+import sys
+text = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+for raw in text.splitlines():
+    line = raw.strip()
+    if line.startswith("timestamp="):
+        print(line.split("=", 1)[1].replace(r"\:", ":"))
+        break
+PY
+  )"
+  rm -f "$state"
+  if [[ -z "$PLANET_TS" ]]; then
+    echo "WARNING: planet minutely state.txt had no timestamp" >&2
+    return 1
+  fi
+  echo "Planet minutely:      ${PLANET_TS}"
 }
 
 source_is_current() {
@@ -653,12 +775,12 @@ derived_is_current() {
   if [[ ! -f "$EXTRACT_XML" || ! -s "$EXTRACT_XML" ]]; then
     return 1
   fi
-  if [[ ! -f "$STAMP_FILE" || ! -f "$SOURCE_PBF" ]]; then
+  if [[ ! -f "$STAMP_FILE" || ! -f "$EXTRACT_INPUT_PBF" ]]; then
     return 1
   fi
-  python3 - "$STAMP_FILE" "$SOURCE_PBF" "$BOUNDARY" "$EXTRACT_STRATEGY" "$GEOFABRIK_URL" <<'PY'
+  python3 - "$STAMP_FILE" "$EXTRACT_INPUT_PBF" "$BOUNDARY" "$EXTRACT_STRATEGY" "$GEOFABRIK_URL" "$UPDATE_MODE" <<'PY'
 import os, sys
-stamp_path, source, boundary, strategy, url = sys.argv[1:]
+stamp_path, source, boundary, strategy, url, mode = sys.argv[1:]
 data = {}
 with open(stamp_path, encoding="utf-8") as handle:
     for raw in handle:
@@ -670,6 +792,8 @@ with open(stamp_path, encoding="utf-8") as handle:
 ok = (
     data.get("url") == url
     and data.get("strategy") == strategy
+    and data.get("mode", "geofabrik") == mode
+    and data.get("extract_from", source) == source
     and data.get("source_size") == str(os.path.getsize(source))
     and data.get("source_mtime") == str(int(os.path.getmtime(source)))
     and data.get("boundary") == boundary
@@ -684,8 +808,10 @@ write_stamp() {
   cat >"$STAMP_FILE" <<EOF
 url=${GEOFABRIK_URL}
 strategy=${EXTRACT_STRATEGY}
-source_size=$(file_size "$SOURCE_PBF")
-source_mtime=$(file_mtime "$SOURCE_PBF")
+mode=${UPDATE_MODE}
+extract_from=${EXTRACT_INPUT_PBF}
+source_size=$(file_size "$EXTRACT_INPUT_PBF")
+source_mtime=$(file_mtime "$EXTRACT_INPUT_PBF")
 boundary=${BOUNDARY}
 boundary_mtime=$(file_mtime "$BOUNDARY")
 EOF
@@ -777,6 +903,169 @@ promote_derived() {
   write_stamp
 }
 
+pbf_header_timestamp() {
+  if ! try_load_osm_info "$1" 0; then
+    return 1
+  fi
+  printf '%s' "${INFO_TIMESTAMP:-}"
+}
+
+bootstrap_working_source() {
+  echo "Bootstrapping working source from $(relpath "$SOURCE_PBF")"
+  rm -f "$WORKING_TMP"
+  cp -f "$SOURCE_PBF" "$WORKING_TMP"
+  if ! osmium fileinfo "$WORKING_TMP" >/dev/null; then
+    fail "Bootstrapped working PBF is not readable by osmium"
+  fi
+  mv -f "$WORKING_TMP" "$WORKING_PBF"
+  CLEANUP_WORKING_TMP=0
+}
+
+update_working_source_fresh() {
+  require_cmd osmupdate
+  require_cmd osmconvert
+  require_cmd wget
+  mkdir -p "$(dirname "$WORKING_PBF")" "$(dirname "$OSMUPDATE_TEMP")"
+  rm -f "$WORKING_TMP"
+
+  local need_bootstrap=0
+  if [[ "$BOOTSTRAP" -eq 1 ]]; then
+    need_bootstrap=1
+  elif [[ ! -f "$WORKING_PBF" || ! -s "$WORKING_PBF" ]]; then
+    need_bootstrap=1
+  else
+    local geo_ts work_ts geo_epoch work_epoch
+    geo_ts="$(pbf_header_timestamp "$SOURCE_PBF" || true)"
+    work_ts="$(pbf_header_timestamp "$WORKING_PBF" || true)"
+    if [[ -z "$work_ts" ]]; then
+      need_bootstrap=1
+    elif [[ -n "$geo_ts" ]]; then
+      geo_epoch="$(ts_to_epoch "$geo_ts")"
+      work_epoch="$(ts_to_epoch "$work_ts")"
+      if (( geo_epoch > work_epoch )); then
+        echo "Geofabrik source is newer than the working copy; re-bootstrapping."
+        need_bootstrap=1
+      fi
+    fi
+  fi
+
+  if [[ "$need_bootstrap" -eq 1 ]]; then
+    bootstrap_working_source
+  fi
+  CLEANUP_WORKING_TMP=1
+
+  FRESH_START_TS="$(pbf_header_timestamp "$WORKING_PBF" || true)"
+  if [[ -z "$FRESH_START_TS" ]]; then
+    fail "Working PBF has no timestamp; cannot apply planet replication"
+  fi
+  echo "Replication start:    ${FRESH_START_TS}"
+  fetch_planet_minutely_timestamp || true
+  echo "Applying planet.openstreetmap.org replication without clipping"
+
+  local update_log update_rc
+  update_log="${TMP_ROOT}/${REGION_ID}-osmupdate.log"
+  # Never clip replication diffs: -B reintroduces missing way→node refs.
+  # --keep-tempfiles/--trust-tempfiles persist planet diffs under
+  # osm-data/.update-tmp/osmupdate/ so a second --fresh run only fetches
+  # newly published files.
+  local osmupdate_cmd=(
+    osmupdate
+    "$WORKING_PBF"
+    "$WORKING_TMP"
+    --keep-tempfiles
+    --trust-tempfiles
+    -t="$OSMUPDATE_TEMP"
+    -v
+  )
+  local joined="${osmupdate_cmd[*]}"
+  if [[ "$joined" == *"-B="* || "$joined" == *"--bounding-polygon"* ]]; then
+    fail "Internal error: osmupdate would run with clipping"
+  fi
+
+  set +e
+  "${osmupdate_cmd[@]}" 2>&1 | tee "$update_log"
+  update_rc=${PIPESTATUS[0]}
+  set -e
+
+  if grep -qiE 'already up-to-date|already up to date' "$update_log"; then
+    echo "Working source is already up-to-date with available planet diffs."
+    FRESH_DIFFS="$(count_replication_diffs "$update_log")"
+    CLEANUP_WORKING_TMP=1
+    rm -f "$WORKING_TMP"
+  elif [[ "$update_rc" -ne 0 ]]; then
+    fail "osmupdate failed with exit code ${update_rc}"
+  else
+    if [[ ! -f "$WORKING_TMP" || ! -s "$WORKING_TMP" ]]; then
+      fail "osmupdate did not create $(relpath "$WORKING_TMP")"
+    fi
+    if ! osmium fileinfo "$WORKING_TMP" >/dev/null; then
+      fail "osmium fileinfo cannot read updated working PBF"
+    fi
+    local new_ts
+    new_ts="$(pbf_header_timestamp "$WORKING_TMP" || true)"
+    if [[ -z "$new_ts" ]]; then
+      fail "Updated working PBF has no timestamp"
+    fi
+    if (( $(ts_to_epoch "$new_ts") < $(ts_to_epoch "$FRESH_START_TS") )); then
+      fail "Updated working timestamp ${new_ts} is older than ${FRESH_START_TS}"
+    fi
+    FRESH_DIFFS="$(count_replication_diffs "$update_log")"
+    mv -f "$WORKING_TMP" "$WORKING_PBF"
+    CLEANUP_WORKING_TMP=0
+    echo "Replication applied:  ${new_ts}"
+  fi
+
+  AFTER_TS="$(pbf_header_timestamp "$WORKING_PBF" || true)"
+  FRESH_AFTER_TS="$AFTER_TS"
+  if [[ -z "$FRESH_DIFFS" ]]; then
+    FRESH_DIFFS=0
+  fi
+  echo "Replication result:   ${FRESH_AFTER_TS:-unknown}"
+  echo "Replication diffs:    ${FRESH_DIFFS}"
+  echo "Working PBF:          $(relpath "$WORKING_PBF") ($(format_mib "$(file_size "$WORKING_PBF")"))"
+  write_working_state
+}
+
+write_working_state() {
+  if [[ -z "$WORKING_STATE" ]]; then
+    return 0
+  fi
+  cat >"$WORKING_STATE" <<EOF
+region=${REGION_ID}
+bootstrap_source=$(relpath "$SOURCE_PBF")
+working=$(relpath "$WORKING_PBF")
+start_timestamp=${FRESH_START_TS}
+result_timestamp=${FRESH_AFTER_TS}
+planet_timestamp=${PLANET_TS}
+diffs=${FRESH_DIFFS}
+updated_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+EOF
+}
+
+count_replication_diffs() {
+  python3 - "$1" <<'PY'
+import re, sys
+text = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+# osmupdate -v logs e.g. "minutely changefile 7269932: downloading"
+# The sequence that only has a timestamp (the file's current seq) is not counted.
+seqs = set(
+    re.findall(
+        r"(?:minutely|hourly|daily)\s+changefile\s+(\d+):\s+downloading\b",
+        text,
+        re.I,
+    )
+)
+if not seqs:
+    seqs = set(
+        re.findall(
+            r"replication/(?:minute|hour|day)/[0-9/]+\.osc(?:\.gz)?",
+            text,
+        )
+    )
+print(len(seqs))
+PY
+}
+
 parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -801,6 +1090,13 @@ parse_args() {
         ;;
       --force)
         FORCE=1
+        ;;
+      --fresh)
+        FRESH=1
+        UPDATE_MODE="fresh"
+        ;;
+      --bootstrap)
+        BOOTSTRAP=1
         ;;
       --)
         shift
@@ -853,12 +1149,24 @@ if [[ -z "$REGION_ID" ]]; then
 fi
 
 load_region "$REGION_ID"
+if [[ "$BOOTSTRAP" -eq 1 && "$FRESH" -eq 0 ]]; then
+  fail "--bootstrap requires --fresh"
+fi
+if [[ "$FRESH" -eq 1 ]]; then
+  UPDATE_MODE="fresh"
+  REPLICATION_NOTE="planet minutely"
+fi
 SOURCE_META="${SOURCE_PBF}.http"
 STAMP_FILE="$(dirname "$EXTRACT_PBF")/.source-stamp"
 BACKUP_DIR="$(dirname "$EXTRACT_PBF")/backups"
 # osmium infers format from the filename. Temporary PBFs must end in
 # .osm.pbf, not .osm.pbf.tmp.
 SOURCE_TMP="${SOURCE_PBF%.osm.pbf}.tmp.osm.pbf"
+WORKING_PBF="${SOURCE_PBF%.osm.pbf}-working.osm.pbf"
+WORKING_TMP="${SOURCE_PBF%.osm.pbf}-working.tmp.osm.pbf"
+WORKING_STATE="${SOURCE_PBF%.osm.pbf}-working.state"
+OSMUPDATE_TEMP="${TMP_ROOT}/osmupdate/temp"
+EXTRACT_INPUT_PBF="$SOURCE_PBF"
 EXTRACT_TMP="$(dirname "$EXTRACT_PBF")/current.new.osm.pbf"
 XML_TMP="$(dirname "$EXTRACT_XML")/current.new.osm"
 CHECKREFS_LOG="${TMP_ROOT}/${REGION_ID}-check-refs.log"
@@ -880,7 +1188,7 @@ fi
 load_boundary_bbox
 
 mkdir -p "$(dirname "$SOURCE_PBF")" "$(dirname "$EXTRACT_PBF")" "$(dirname "$EXTRACT_XML")" "$TMP_ROOT" "$BACKUP_DIR"
-rm -f "$EXTRACT_TMP" "$XML_TMP" "$SOURCE_TMP" "$SOURCE_TMP_LEGACY"
+rm -f "$EXTRACT_TMP" "$XML_TMP" "$SOURCE_TMP" "$SOURCE_TMP_LEGACY" "$WORKING_TMP"
 
 echo "OSM update directory: ${OSM_DIR}"
 print_region_config
@@ -901,26 +1209,43 @@ fi
 
 echo "Checking Geofabrik source..."
 source_started="$(date -u +%s)"
-fetch_remote_headers
-if source_is_current; then
-  echo "Geofabrik source is already current; download skipped."
+if fetch_remote_headers; then
+  if source_is_current; then
+    echo "Geofabrik source is already current; download skipped."
+    SOURCE_STATUS="UNCHANGED"
+    validate_source_pbf "$SOURCE_PBF"
+  else
+    download_source
+    SOURCE_STATUS="UPDATED"
+  fi
+elif [[ -f "$SOURCE_PBF" && -s "$SOURCE_PBF" ]]; then
+  echo "WARNING: Could not fetch Geofabrik HTTP headers; using local source." >&2
   SOURCE_STATUS="UNCHANGED"
   validate_source_pbf "$SOURCE_PBF"
 else
-  download_source
-  SOURCE_STATUS="UPDATED"
+  fail "Could not fetch HTTP headers from ${GEOFABRIK_URL}"
 fi
 SOURCE_SIZE="$(file_size "$SOURCE_PBF")"
 load_osm_info "$SOURCE_PBF" 0
 AFTER_TS="${INFO_TIMESTAMP:-$REMOTE_LAST_MODIFIED}"
-SOURCE_RUNTIME=$(( $(date -u +%s) - source_started ))
 echo "Source PBF:           $(relpath "$SOURCE_PBF") ($(format_mib "$SOURCE_SIZE"))"
 if [[ -n "$AFTER_TS" ]]; then
   echo "Source timestamp:     ${AFTER_TS}"
 fi
 
+if [[ "$FRESH" -eq 1 ]]; then
+  update_working_source_fresh
+  EXTRACT_INPUT_PBF="$WORKING_PBF"
+  SOURCE_SIZE="$(file_size "$WORKING_PBF")"
+fi
+SOURCE_RUNTIME=$(( $(date -u +%s) - source_started ))
+
 if derived_is_current; then
-  echo "Regional extract and XML already match the current Geofabrik source and boundary."
+  if [[ "$UPDATE_MODE" == "fresh" ]]; then
+    echo "Regional extract and XML already match the current fresh working source and boundary."
+  else
+    echo "Regional extract and XML already match the current Geofabrik source and boundary."
+  fi
   EXTRACT_STATUS="UNCHANGED"
   XML_STATUS="UNCHANGED"
   load_osm_info "$EXTRACT_PBF" 1
@@ -929,7 +1254,9 @@ if derived_is_current; then
   AFTER_RELS="$INFO_RELS"
   EXTRACT_SIZE="$(file_size "$EXTRACT_PBF")"
   XML_SIZE="$(file_size "$EXTRACT_XML")"
-  AFTER_TS="${INFO_TIMESTAMP:-$AFTER_TS}"
+  if [[ -z "$FRESH_AFTER_TS" ]]; then
+    AFTER_TS="${INFO_TIMESTAMP:-$AFTER_TS}"
+  fi
   STATUS="SUCCESS"
   print_summary
   SUMMARY_PRINTED=1
@@ -944,7 +1271,7 @@ if ! osmium extract \
     --set-bounds \
     --overwrite \
     -o "$EXTRACT_TMP" \
-    "$SOURCE_PBF"; then
+    "$EXTRACT_INPUT_PBF"; then
   fail "osmium extract failed"
 fi
 if [[ ! -f "$EXTRACT_TMP" || ! -s "$EXTRACT_TMP" ]]; then
@@ -956,7 +1283,9 @@ fi
 
 echo "Validating extracted PBF..."
 load_osm_info "$EXTRACT_TMP" 1
-AFTER_TS="${INFO_TIMESTAMP:-$AFTER_TS}"
+if [[ -z "$FRESH_AFTER_TS" ]]; then
+  AFTER_TS="${INFO_TIMESTAMP:-$AFTER_TS}"
+fi
 EXTRACT_SIZE="$INFO_SIZE"
 AFTER_NODES="$INFO_NODES"
 AFTER_WAYS="$INFO_WAYS"
