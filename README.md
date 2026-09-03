@@ -476,49 +476,7 @@ next round. Combine with `-b` on later passes.
 
 ## Local application
 
-The detector settings stay as validated (zoom 14, threshold 100, distance 35 m,
-minsize 20, parallel / ferry / heat-halo, plus golf on All). The workflow always
-passes `-z 14` from region config and always updates OSM with `--fresh`.
-`--dry-run` still runs fresh OSM and detection; it only skips MapRoulette writes.
-The workflow talks to MapRoulette over HTTP. It does **not** use mr-cli.
-
-API key (never commit):
-
-```
-MAPROULETTE_API_KEY
-```
-
-or the ignored file `.maproulette-api-key`.
-
-Dry-run (generates files, does not change MapRoulette):
-
-```
-python workflow.py mallorca --dry-run
-```
-
-Reuse already produced GeoJSON:
-
-```
-python workflow.py mallorca --dry-run --skip-osm --skip-detect --from-geojson-dir validation
-```
-
-Real run:
-
-```
-python workflow.py mallorca
-```
-
-Sequential production (map Ride/Run first, then refresh OSM and run All):
-
-```
-python workflow.py mallorca --phase ride-run
-python workflow.py mallorca --phase all
-```
-
-`--no-upload` is the same MapRoulette guard as `--dry-run`. New challenges are
-dated and stay `enabled=false`. Existing review history is never deleted.
-
-Local UI (127.0.0.1 only):
+Normal use is the local web UI. It only binds to `127.0.0.1`.
 
 ```
 python webapp.py
@@ -526,14 +484,76 @@ python webapp.py
 
 Then open http://127.0.0.1:5000
 
+### Production flow
+
+1. Choose the region (Mallorca).
+2. Click **Ride & Run suchen**.
+3. Review the Ride and Run MapRoulette challenges.
+4. When those are done, click **Weiter mit All**.
+5. Review the All challenge.
+
+Each phase refreshes the local OSM extract from **planet minutely** (`--fresh`),
+then runs the detector. The workflow always passes **`-z 14`** (the `strava.py`
+CLI default remains 15 and is not used). All uses the same suppressors plus
+`--suppress-golf`.
+
+Before detection, previously reviewed MapRoulette tasks marked **Not an Issue**
+are loaded from the region history (`state/<region>/review-history.json` and
+`tasks.sqlite`) and passed to `strava.py` as `-b`. Fixed / Already Fixed / Too
+Hard / Skipped are not permanently suppressed. Smoke-test challenges are not
+part of this history.
+
+New challenges are dated, stay `enabled=false`, and are never rebuilt in place.
+
+### Configuration
+
+MapRoulette project: **54842** (`strava_detections`).
+
+API key (never commit): environment variable `MAPROULETTE_API_KEY`, or the
+gitignored file `.maproulette-api-key` in the repository root.
+
+Strava tiles: `STRAVA_COOKIE`, or gitignored `.strava-cookie`.
+
+Regions, challenge name prefixes, and extract paths: `osm-regions.conf`.
+
+### CLI alternatives
+
+The UI calls the same functions as:
+
+```
+python workflow.py mallorca --phase ride-run
+python workflow.py mallorca --phase all
+```
+
+Dry-run (fresh OSM and detection, no MapRoulette writes):
+
+```
+python workflow.py mallorca --dry-run
+```
+
+`--no-upload` is the same MapRoulette guard. History-only sync:
+
+```
+python workflow.py mallorca --sync-history
+```
+
+API smoke test (temporary challenge, not production history):
+
+```
+python workflow.py mallorca --maproulette-smoke-test
+```
+
+The workflow talks to MapRoulette over HTTP. It does **not** use mr-cli.
+
 ## Other files
 
 - `strava.py` — current detector
 - `diagnostics.py` — shared geometry / diagnostics / suppression helpers
 - `analyze_diagnostics.py` — offline rule analysis
-- `workflow.py` — one-command region workflow
+- `workflow.py` — region workflow used by the UI and CLI
 - `maproulette.py` — MapRoulette HTTP client
+- `review_history.py` — persistent Not-an-Issue history
 - `webapp.py` — local operator UI
 - `strava-ride.py` — older ride-oriented script (Overpass only; not the current detector)
-- `update-osm.ps1` / `update-osm.sh` — Geofabrik OSM extract updater
+- `update-osm.ps1` / `update-osm.sh` — OSM extract updater (`--fresh` = planet minutely)
 - `osm-regions.conf` — region URLs, boundaries, challenge names, and output paths

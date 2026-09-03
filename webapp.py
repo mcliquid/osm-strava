@@ -284,6 +284,7 @@ HTML = r"""<!DOCTYPE html>
 const STAGE_LABELS = {
   validate: "Konfiguration geprüft",
   verify_api: "MapRoulette-Zugang geprüft",
+  review_history: "MapRoulette-Historie synchronisiert",
   osm: "OSM-Daten aktualisiert",
   ride: "Ride analysiert",
   run: "Run analysiert",

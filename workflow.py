@@ -31,6 +31,12 @@ from geojson_util import (
 )
 from maproulette import MapRouletteClient, MapRouletteConfig, MapRouletteError, load_api_key, redact
 from regions import load_all_regions, load_region
+from review_history import (
+    history_exists,
+    register_production_challenge,
+    sync_review_history,
+    tasks_db_path,
+)
 
 REPO = Path(__file__).resolve().parent
 STATE_DIR = REPO / "state"
@@ -237,7 +243,7 @@ class Progress:
         self.log(f"FEHLER: {message}")
 
 
-def detector_command(region, layer, raw_path, stats_path, zoom):
+def detector_command(region, layer, raw_path, stats_path, zoom, tasks_db=None):
     cmd = [
         sys.executable,
         str(REPO / "strava.py"),
@@ -258,6 +264,8 @@ def detector_command(region, layer, raw_path, stats_path, zoom):
     ]
     if layer == "all":
         cmd.append("--suppress-golf")
+    if tasks_db and Path(tasks_db).exists():
+        cmd.extend(["-b", os.path.normpath(str(tasks_db))])
     return cmd
 
 
@@ -312,8 +320,8 @@ def run_osm_update(region_id, progress, *, fresh=True, log_path=None):
     return parsed, output
 
 
-def run_detector(region, layer, raw_path, stats_path, progress, zoom):
-    cmd = detector_command(region, layer, raw_path, stats_path, zoom)
+def run_detector(region, layer, raw_path, stats_path, progress, zoom, tasks_db=None):
+    cmd = detector_command(region, layer, raw_path, stats_path, zoom, tasks_db=tasks_db)
     progress.log("Detektor: " + " ".join(cmd))
     result = subprocess.run(cmd, cwd=str(REPO), capture_output=True, text=True)
     if result.stdout:
@@ -582,6 +590,15 @@ def upload_layer_challenges(
             extra={"checkinComment": copy["checkinComment"]},
         )
         challenge_id = created["id"]
+        register_production_challenge(region["id"], {
+            "id": challenge_id,
+            "layer": layer,
+            "name": plan["challenge_name"],
+            "challenge_name": plan["challenge_name"],
+            "task_count": plan["task_count"],
+            "project_id": plan.get("project_id") or 54842,
+            "created_at": iso_now(),
+        })
         entry = remember({
             **plan,
             "created": True,
@@ -770,6 +787,33 @@ def run_workflow(
                         existing_names.add(found.get("name") or name)
         progress.finish()
 
+        if not upload_only:
+            progress.start("review_history", "MapRoulette-Historie synchronisieren")
+            sync = sync_review_history(region_id, client)
+            result.files["review_history"] = str(STATE_DIR / region_id / "review-history.json")
+            db_path = tasks_db_path(region_id)
+            if db_path.exists():
+                result.files["tasks_db"] = str(db_path)
+            result.counts["review_challenges"] = sync.challenges_checked
+            result.counts["not_an_issue"] = sync.nai_count
+            for warning in sync.warnings:
+                result.warnings.append(warning)
+                progress.log(warning)
+            if not sync.ok:
+                if history_exists(region_id):
+                    result.warnings.append(sync.error or "Historie-Sync unvollständig.")
+                    progress.log(sync.error or "Historie-Sync unvollständig — lokale Historie bleibt.")
+                elif not skip_detect:
+                    raise WorkflowError(sync.error or "MapRoulette-Historie konnte nicht geladen werden.")
+                else:
+                    result.warnings.append(sync.error or "Keine lokale MapRoulette-Historie.")
+                    progress.log(sync.error or "Keine lokale MapRoulette-Historie.")
+            elif sync.used_cache:
+                progress.log("Letzte lokale Historie wird verwendet.")
+            progress.finish(
+                f"{sync.challenges_checked} Challenges, {sync.nai_count} Not an Issue"
+            )
+
         progress.start("osm", "OSM-Daten aktualisieren")
         osm_info = {
             "mode": "geofabrik" if geofabrik else "fresh",
@@ -839,7 +883,15 @@ def run_workflow(
                     shutil.copy2(source, raw_path)
                     progress.log(f"Übernehme vorhandene Datei: {source}")
                 else:
-                    run_detector(region, layer, raw_path, stats_path, progress, zoom)
+                    run_detector(
+                        region,
+                        layer,
+                        raw_path,
+                        stats_path,
+                        progress,
+                        zoom,
+                        tasks_db=tasks_db_path(region_id),
+                    )
                 features = annotate_provenance(
                     load_features(raw_path),
                     region=region_id,
@@ -1070,6 +1122,11 @@ def build_parser():
             "Keine Produktions-Challenges, kein Run/All, kein Löschen."
         ),
     )
+    parser.add_argument(
+        "--sync-history",
+        action="store_true",
+        help="Nur MapRoulette-Review-Historie synchronisieren (kein Detektor, kein Upload).",
+    )
     return parser
 
 
@@ -1235,6 +1292,24 @@ def main(argv=None):
     if args.maproulette_smoke_test:
         try:
             return run_maproulette_smoke_test(args.region)
+        except (WorkflowError, MapRouletteError) as exc:
+            print(f"FEHLER: {redact(exc)}", file=sys.stderr)
+            return 1
+    if args.sync_history:
+        try:
+            config = MapRouletteConfig()
+            client = MapRouletteClient(config) if config.has_api_key() else None
+            sync = sync_review_history(args.region, client)
+            print(f"Challenges geprüft: {sync.challenges_checked}")
+            print(f'Bekannte "Not an Issue"-Fälle: {sync.nai_count}')
+            print(f"Historie: {STATE_DIR / args.region / 'review-history.json'}")
+            print(f"tasks.sqlite: {tasks_db_path(args.region)}")
+            for warning in sync.warnings:
+                print(f"Hinweis: {warning}")
+            if not sync.ok:
+                print(f"FEHLER: {sync.error}", file=sys.stderr)
+                return 1
+            return 0
         except (WorkflowError, MapRouletteError) as exc:
             print(f"FEHLER: {redact(exc)}", file=sys.stderr)
             return 1
