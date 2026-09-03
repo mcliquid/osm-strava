@@ -30,6 +30,7 @@ from diagnostics import (
     component_between_heat_ratio,
     component_osm_follow_metrics,
     nearest_ferry_distance_m,
+    osm_open_area_tags_match,
     should_suppress_ferry,
     should_suppress_heat_halo,
     should_suppress_parallel_osm,
@@ -829,6 +830,7 @@ class OsmIndex:
         self.n_ways = n_ways
         self.n_relations = n_relations
         self.construction_items = []
+        self.open_area_items = []
         self._tree = STRtree([item.envelope for item in items])
 
     def query(self, tile_env):
@@ -1226,11 +1228,14 @@ def load_osm_index_from_xml(osm_path, south, west, north, east):
     member_way_ids = set()
     relations = []
     construction_relations = []
+    open_area_relations = []
     for _tag, elem in _iterparse_osm_elements(osm_path, ("relation",)):
         pairs = _xml_tag_pairs(elem)
+        tags = {k: v for k, v in pairs}
         is_relevant = osm_tags_match_pairs(pairs)
         is_construction = collect_diagnostic_osm and _is_construction_pairs(pairs)
-        if not is_relevant and not is_construction:
+        is_open_area = collect_diagnostic_osm and osm_open_area_tags_match(tags)
+        if not is_relevant and not is_construction and not is_open_area:
             continue
         osm_id = elem.attrib.get("id", "")
         members = []
@@ -1244,18 +1249,23 @@ def load_osm_index_from_xml(osm_path, south, west, north, east):
             relations.append((osm_id, pairs, members))
         if is_construction:
             construction_relations.append((osm_id, pairs, members))
+        if is_open_area:
+            open_area_relations.append((osm_id, pairs, members))
 
     needed_node_ids = set()
     matching_ways = {}
     member_way_refs = {}
     construction_ways = {}
+    open_area_ways = {}
     for _tag, elem in _iterparse_osm_elements(osm_path, ("way",)):
         osm_id = elem.attrib.get("id", "")
         pairs = _xml_tag_pairs(elem)
+        tags = {k: v for k, v in pairs}
         node_refs = _way_node_refs(elem)
         matches = osm_tags_match_pairs(pairs)
         is_construction = collect_diagnostic_osm and _is_construction_pairs(pairs)
-        if matches or is_construction or osm_id in member_way_ids:
+        is_open_area = collect_diagnostic_osm and osm_open_area_tags_match(tags)
+        if matches or is_construction or is_open_area or osm_id in member_way_ids:
             needed_node_ids.update(node_refs)
         if matches:
             matching_ways[osm_id] = (pairs, node_refs)
@@ -1263,6 +1273,8 @@ def load_osm_index_from_xml(osm_path, south, west, north, east):
             member_way_refs[osm_id] = node_refs
         if is_construction:
             construction_ways[osm_id] = (pairs, node_refs)
+        if is_open_area:
+            open_area_ways[osm_id] = (pairs, node_refs)
 
     node_coords = {}
     for _tag, elem in _iterparse_osm_elements(osm_path, ("node",)):
@@ -1338,6 +1350,36 @@ def load_osm_index_from_xml(osm_path, south, west, north, east):
         print_verbose(
             f"Diagnostic construction objects: {len(construction_items)} "
             f"(highway=construction is also masked as existing OSM geometry)"
+        )
+        open_area_items = []
+        for osm_id, pairs, node_refs in (
+            (wid, pdata[0], pdata[1]) for wid, pdata in open_area_ways.items()
+        ):
+            coords = way_geom.get(osm_id)
+            if coords is None:
+                coords = refs_to_coords(node_refs)
+            if not coords or not _coords_intersect_bbox(coords, bbox_merc):
+                continue
+            open_area_items.extend(_draw_open_area_items_from_way(osm_id, pairs, coords))
+        for rel_id, tags, members in open_area_relations:
+            way_members = []
+            intersects = False
+            for ref, role in members:
+                coords = way_geom.get(ref)
+                if not coords:
+                    continue
+                if _coords_intersect_bbox(coords, bbox_merc):
+                    intersects = True
+                way_members.append((role, coords))
+            if not intersects or not way_members:
+                continue
+            open_area_items.extend(
+                _draw_open_area_items_from_relation(rel_id, tags, way_members)
+            )
+        osm_index.open_area_items = open_area_items
+        print_verbose(
+            f"Diagnostic open-area objects: {len(open_area_items)} "
+            f"(not used for masking or suppression)"
         )
     run_stats.osm_source = f"local XML ({os.path.basename(osm_path)})"
     run_stats.osm_ways = osm_index.n_ways
@@ -1443,6 +1485,56 @@ def plot_osm_items(items, draw, width, pixel_size):
         plot_circle(draw, item.coords, tile_bbox, width, pixel_size)
 
 
+def _is_open_area_geometry_pairs(pairs, is_relation):
+    """Force area geometry for diagnostic open-area objects when closed/MP."""
+    if _is_area_from_tags(pairs, is_relation):
+        return True
+    tags = {k: v for k, v in pairs}
+    if not osm_open_area_tags_match(tags):
+        return False
+    # Beach/sand/parking/sport often lack area=yes but are closed rings or MPs.
+    if is_relation:
+        return True
+    return True
+
+
+def _draw_open_area_items_from_way(osm_id, tags, coords):
+    items = []
+    envelope = _envelope_from_coords(coords)
+    if envelope is None:
+        return items
+    fill = _is_open_area_geometry_pairs(tags, False)
+    # Closed ring → polygon; open coastline stays a line for distance-only metrics.
+    if fill and len(coords) >= 4 and coords[0] == coords[-1]:
+        fill = True
+    elif fill and (coords[0] != coords[-1] or len(coords) < 4):
+        fill = False
+    items.append(OsmDrawItem(
+        "way",
+        str(osm_id),
+        fill,
+        coords,
+        envelope,
+        _item_tags_payload(tags),
+    ))
+    return items
+
+
+def _draw_open_area_items_from_relation(osm_id, tags, way_members):
+    # Always treat matching open-area relations as filled outers.
+    items = []
+    tag_payload = _item_tags_payload(tags)
+    outer_coords = [coords for role, coords in way_members if role == "outer" and coords]
+    if not outer_coords:
+        outer_coords = [coords for _role, coords in way_members if coords]
+    for ring in _merge_outer_rings(outer_coords, osm_id):
+        envelope = _envelope_from_coords(ring)
+        if envelope is None:
+            continue
+        items.append(OsmDrawItem("relation", str(osm_id), True, ring, envelope, tag_payload))
+    return items
+
+
 def setup_diagnostic_osm(loaded_index):
     global diagnostic_osm
     need_lookup = (
@@ -1455,10 +1547,16 @@ def setup_diagnostic_osm(loaded_index):
         diagnostic_osm = None
         return
     construction_items = getattr(loaded_index, "construction_items", None) or []
-    diagnostic_osm = DiagnosticOsmLookup(loaded_index.items, construction_items)
+    open_area_items = getattr(loaded_index, "open_area_items", None) or []
+    diagnostic_osm = DiagnosticOsmLookup(
+        loaded_index.items,
+        construction_items,
+        open_area_items=open_area_items,
+    )
     print_verbose(
         f"Diagnostic OSM lookup: {len(loaded_index.items)} relevant objects, "
-        f"{len(construction_items)} construction objects"
+        f"{len(construction_items)} construction objects, "
+        f"{len(open_area_items)} open-area objects"
     )
 
 # This routine check if a strava heatmap tile contains a way not in OSM

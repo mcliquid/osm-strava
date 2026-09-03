@@ -46,6 +46,22 @@ Sampling is deterministic: per OSM class, farthest-point from the westernmost
 candidate, tie-broken by `candidate_id`. These files are for manual review only.
 Do not treat them as a MapRoulette challenge.
 
+## Open-area diagnostics (research)
+
+`--diagnostics` can record OSM **area** context beside the usual way metrics
+(`open_area_class`, `open_area_center_inside`, `open_area_component_inside_frac`,
+`open_area_component_crosses_boundary`, `open_area_component_stays_inside`, …).
+Those objects are loaded only for diagnostics and are **not** part of the heatmap
+mask and **not** used by any suppressor.
+
+Offline review of the Mallorca samples:
+
+```
+python validation/analyze_open_area.py
+```
+
+Writes `validation/open-area-analysis.md`.
+
 ## Production Remaining
 
 When the diagnostics CSV comes from a run with suppression flags enabled,

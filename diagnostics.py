@@ -102,6 +102,17 @@ DIAGNOSTIC_COLUMNS = [
     "between_heat_median",
     "between_heat_ratio",
     "heat_halo_score",
+    # Diagnostic-only OSM area context (activity-on-area). Never used for suppression.
+    "open_area_class",
+    "open_area_osm_id",
+    "open_area_osm_type",
+    "open_area_name",
+    "open_area_tags",
+    "open_area_center_inside",
+    "open_area_distance_m",
+    "open_area_component_inside_frac",
+    "open_area_component_crosses_boundary",
+    "open_area_component_stays_inside",
     "raw_candidate",
     "too_small",
     "accepted",
@@ -111,6 +122,24 @@ DIAGNOSTIC_COLUMNS = [
     "suppressed_ferry",
     "suppressed_heat_halo",
 ]
+
+# Diagnostic-only open-area classes. Not part of the OSM mask universe.
+OPEN_AREA_CLASSES = (
+    "golf_course",
+    "beach",
+    "sand",
+    "pitch",
+    "sports_centre",
+    "stadium",
+    "sport_climbing",
+    "sport_area",
+    "parking",
+    "pedestrian_area",
+    "park",
+    "playground",
+)
+_OPEN_AREA_SEARCH_M = 250.0
+_OPEN_AREA_CROSS_EPS = 1e-6
 
 
 def _fmt_float(value, digits=6):
@@ -585,7 +614,7 @@ def _component_osm_follow_metrics(merc_xy, axis_vec, lookup):
 class DiagnosticOsmLookup:
     """Nearest-neighbor queries over the same relevant OSM universe used for masking."""
 
-    def __init__(self, items, construction_items=None):
+    def __init__(self, items, construction_items=None, open_area_items=None):
         self._all = self._prepare(items)
         ferry_items = [
             item for item in items
@@ -593,6 +622,7 @@ class DiagnosticOsmLookup:
         ]
         self._ferry = self._prepare(ferry_items)
         self._construction = self._prepare(construction_items or [])
+        self.open_areas = OpenAreaLookup(open_area_items or [])
 
     @staticmethod
     def _prepare(items):
@@ -642,6 +672,238 @@ class DiagnosticOsmLookup:
         if idxs.size == 0:
             return []
         return [(store["items"][int(i)], store["geoms"][int(i)]) for i in idxs]
+
+
+def classify_open_area_tags(tags):
+    """Return diagnostic open-area class or None. Does not imply suppression."""
+    if not tags:
+        return None
+    leisure = (tags.get("leisure") or "").strip()
+    natural = (tags.get("natural") or "").strip()
+    amenity = (tags.get("amenity") or "").strip()
+    highway = (tags.get("highway") or "").strip()
+    area_highway = (tags.get("area:highway") or "").strip()
+    sport = (tags.get("sport") or "").strip().lower()
+    surface = (tags.get("surface") or "").strip()
+    area_flag = (tags.get("area") or "").strip()
+
+    if leisure == "golf_course":
+        return "golf_course"
+    if natural == "beach":
+        return "beach"
+    if natural == "sand":
+        return "sand"
+    if surface == "sand" and (area_flag == "yes" or leisure or natural):
+        return "sand"
+    if leisure == "pitch":
+        return "pitch"
+    if leisure == "sports_centre":
+        return "sports_centre"
+    if leisure == "stadium":
+        return "stadium"
+    if sport and (
+        any(p == "climbing" or p.startswith("climbing") for p in sport.split(";"))
+    ):
+        return "sport_climbing"
+    if sport and leisure not in ("track",):
+        # sport=* on an area object (loader only keeps area-like geometries)
+        return "sport_area"
+    if amenity in ("parking", "parking_space"):
+        return "parking"
+    if highway == "pedestrian" and area_flag == "yes":
+        return "pedestrian_area"
+    if area_highway == "pedestrian":
+        return "pedestrian_area"
+    if leisure == "park":
+        return "park"
+    if leisure == "playground":
+        return "playground"
+    return None
+
+
+def osm_open_area_tags_match(tags):
+    return classify_open_area_tags(tags) is not None
+
+
+def _empty_open_area_metrics():
+    return {
+        "open_area_class": "",
+        "open_area_osm_id": "",
+        "open_area_osm_type": "",
+        "open_area_name": "",
+        "open_area_tags": "",
+        "open_area_center_inside": "",
+        "open_area_distance_m": "",
+        "open_area_component_inside_frac": "",
+        "open_area_component_crosses_boundary": "",
+        "open_area_component_stays_inside": "",
+    }
+
+
+class OpenAreaLookup:
+    """Diagnostic-only spatial index over OSM area polygons/lines. Never masks heat."""
+
+    def __init__(self, items):
+        self._items = []
+        self._geoms = []
+        self._classes = []
+        for item in items or []:
+            geom = _item_geometry(item)
+            if geom is None or geom.is_empty:
+                continue
+            tags = _item_tags(item)
+            cls = classify_open_area_tags(tags)
+            if cls is None:
+                continue
+            self._items.append(item)
+            self._geoms.append(geom)
+            self._classes.append(cls)
+        self._tree = STRtree(self._geoms) if self._geoms else None
+
+    def __len__(self):
+        return len(self._items)
+
+    def candidates_near(self, merc_x, merc_y, padding=_OPEN_AREA_SEARCH_M):
+        if self._tree is None:
+            return []
+        env = shapely_box(
+            merc_x - padding, merc_y - padding, merc_x + padding, merc_y + padding
+        )
+        indices = self._tree.query(env, predicate="intersects")
+        idxs = np.asarray(indices).reshape(-1)
+        out = []
+        for i in idxs:
+            idx = int(i)
+            out.append((self._items[idx], self._geoms[idx], self._classes[idx]))
+        return out
+
+
+def open_area_metrics_for_candidate(
+    merc_x,
+    merc_y,
+    component_merc_xy,
+    open_area_lookup,
+    preferred_class=None,
+):
+    """Pick the most relevant nearby open area and describe containment.
+
+    Preference: containing polygon of preferred_class, else any containing
+    polygon (golf/beach/sand/climbing first), else nearest by distance.
+    Diagnostic only — does not suppress candidates.
+    """
+    empty = _empty_open_area_metrics()
+    if open_area_lookup is None or len(open_area_lookup) == 0:
+        return empty
+
+    point = Point(merc_x, merc_y)
+    nearby = open_area_lookup.candidates_near(merc_x, merc_y)
+    if not nearby:
+        # Fallback: global nearest among all open areas (still diagnostic).
+        if open_area_lookup._tree is None:
+            return empty
+        index = open_area_lookup._tree.nearest(point)
+        if index is None:
+            return empty
+        idx = int(np.asarray(index).reshape(-1)[0])
+        nearby = [(
+            open_area_lookup._items[idx],
+            open_area_lookup._geoms[idx],
+            open_area_lookup._classes[idx],
+        )]
+
+    priority = {
+        "golf_course": 0,
+        "beach": 1,
+        "sand": 2,
+        "sport_climbing": 3,
+        "pitch": 4,
+        "sports_centre": 5,
+        "stadium": 6,
+        "sport_area": 7,
+        "parking": 8,
+        "pedestrian_area": 9,
+        "park": 10,
+        "playground": 11,
+    }
+
+    scored = []
+    for item, geom, cls in nearby:
+        try:
+            dist = float(geom.distance(point))
+        except Exception:
+            continue
+        center_inside = False
+        if geom.geom_type in ("Polygon", "MultiPolygon"):
+            try:
+                center_inside = bool(geom.contains(point) or geom.covers(point))
+            except Exception:
+                center_inside = False
+        elif dist <= _OPEN_AREA_CROSS_EPS:
+            center_inside = True
+        pref = 0 if preferred_class and cls == preferred_class else 1
+        scored.append((
+            pref,
+            0 if center_inside else 1,
+            priority.get(cls, 99),
+            dist,
+            item,
+            geom,
+            cls,
+            center_inside,
+        ))
+    if not scored:
+        return empty
+    scored.sort()
+    _pref, _in, _pri, dist, item, geom, cls, center_inside = scored[0]
+    tags = _item_tags(item)
+
+    inside_frac = ""
+    crosses = ""
+    stays = ""
+    if component_merc_xy is not None and len(component_merc_xy) > 0:
+        n = len(component_merc_xy)
+        inside_n = 0
+        outside_n = 0
+        if geom.geom_type in ("Polygon", "MultiPolygon"):
+            for xy in component_merc_xy:
+                pt = Point(float(xy[0]), float(xy[1]))
+                try:
+                    if geom.contains(pt) or geom.covers(pt) or geom.distance(pt) <= _OPEN_AREA_CROSS_EPS:
+                        inside_n += 1
+                    else:
+                        outside_n += 1
+                except Exception:
+                    outside_n += 1
+        else:
+            # Line-like open areas: treat within 5 m as "inside" the feature band.
+            band = 5.0
+            for xy in component_merc_xy:
+                pt = Point(float(xy[0]), float(xy[1]))
+                try:
+                    if geom.distance(pt) <= band:
+                        inside_n += 1
+                    else:
+                        outside_n += 1
+                except Exception:
+                    outside_n += 1
+        frac = inside_n / n if n else 0.0
+        inside_frac = _fmt_float(frac, 4)
+        crosses_flag = inside_n > 0 and outside_n > 0
+        crosses = _bool_csv(crosses_flag)
+        stays = _bool_csv((frac >= 0.9) and (not crosses_flag) and center_inside)
+
+    return {
+        "open_area_class": cls,
+        "open_area_osm_id": str(item.osm_id),
+        "open_area_osm_type": item.source,
+        "open_area_name": tags.get("name", ""),
+        "open_area_tags": json.dumps(tags, ensure_ascii=False, separators=(",", ":")),
+        "open_area_center_inside": _bool_csv(center_inside),
+        "open_area_distance_m": _fmt_float(dist, 3),
+        "open_area_component_inside_frac": inside_frac,
+        "open_area_component_crosses_boundary": crosses,
+        "open_area_component_stays_inside": stays,
+    }
 
 
 def _empty_lateral_metrics(zero_cover=False):
@@ -1125,6 +1387,18 @@ def build_diagnostic_row(
         )
     else:
         row.update(_empty_lateral_metrics())
+
+    component_merc = None
+    if n_pixels and bbox_merc is not None:
+        component_merc = pixels_to_mercator(rows, cols, bbox_merc, pixel_size_m)
+    open_lookup = None
+    if lookup is not None:
+        open_lookup = getattr(lookup, "open_areas", None)
+    row.update(
+        open_area_metrics_for_candidate(
+            merc_x, merc_y, component_merc, open_lookup
+        )
+    )
 
     row["raw_candidate"] = _bool_csv(True)
     row["too_small"] = _bool_csv(too_small)
