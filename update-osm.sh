@@ -117,9 +117,10 @@ Regions are defined in osm-regions.conf.
 
   --force       Rebuild the regional extract and XML even if the source
                 and boundary file have not changed.
-  --fresh       Opt-in: advance an unclipped working copy of the Geofabrik
-                source with planet.openstreetmap.org replication, then
-                extract. Default remains Geofabrik-daily.
+  --fresh       Advance an unclipped working copy of the Geofabrik source
+                with planet.openstreetmap.org replication, then extract.
+                The production workflow always passes --fresh. Direct
+                updater default remains Geofabrik-daily.
   --bootstrap   With --fresh, replace the working copy from Geofabrik
                 before applying replication.
 EOF
@@ -261,6 +262,29 @@ fail() {
   SUMMARY_PRINTED=1
   echo "ERROR: $FAIL_REASON" >&2
   exit 1
+}
+
+# Never replace a newer promoted extract with an older Geofabrik/working source.
+reject_downgrade() {
+  local candidate_ts="$1"
+  local candidate_label="$2"
+  if [[ -z "$BEFORE_TS" ]]; then
+    return 0
+  fi
+  local before_epoch candidate_epoch
+  if ! before_epoch="$(ts_to_epoch "$BEFORE_TS" 2>/dev/null)"; then
+    echo "WARNING: could not parse current extract timestamp ${BEFORE_TS}" >&2
+    return 0
+  fi
+  if [[ -z "$candidate_ts" ]]; then
+    fail "OSM update rejected because it would replace newer local data with an older source. Current extract timestamp=${BEFORE_TS}; ${candidate_label} has no timestamp."
+  fi
+  if ! candidate_epoch="$(ts_to_epoch "$candidate_ts" 2>/dev/null)"; then
+    fail "OSM update rejected because it would replace newer local data with an older source. Could not parse ${candidate_label} timestamp (${candidate_ts})."
+  fi
+  if (( candidate_epoch < before_epoch )); then
+    fail "OSM update rejected because it would replace newer local data with an older source. Current extract timestamp=${BEFORE_TS}; ${candidate_label} timestamp=${candidate_ts}."
+  fi
 }
 
 on_exit() {
@@ -1240,6 +1264,25 @@ if [[ "$FRESH" -eq 1 ]]; then
 fi
 SOURCE_RUNTIME=$(( $(date -u +%s) - source_started ))
 
+INPUT_TS="$(pbf_header_timestamp "$EXTRACT_INPUT_PBF" || true)"
+if [[ -n "$INPUT_TS" ]]; then
+  AFTER_TS="$INPUT_TS"
+fi
+reject_downgrade "$INPUT_TS" "proposed source ($(relpath "$EXTRACT_INPUT_PBF"), mode=${UPDATE_MODE})"
+
+# Clipped extracts may lack a header timestamp. A newer --fresh working
+# copy must still block Geofabrik from promoting older data.
+if [[ "$UPDATE_MODE" != "fresh" && -f "$WORKING_PBF" ]]; then
+  work_ts="$(pbf_header_timestamp "$WORKING_PBF" || true)"
+  if [[ -n "$work_ts" && -n "$INPUT_TS" ]]; then
+    work_epoch="$(ts_to_epoch "$work_ts")"
+    input_epoch="$(ts_to_epoch "$INPUT_TS")"
+    if (( input_epoch < work_epoch )); then
+      fail "OSM update rejected because it would replace newer local data with an older source. Fresh working copy timestamp=${work_ts}; proposed Geofabrik source timestamp=${INPUT_TS}."
+    fi
+  fi
+fi
+
 if derived_is_current; then
   if [[ "$UPDATE_MODE" == "fresh" ]]; then
     echo "Regional extract and XML already match the current fresh working source and boundary."
@@ -1355,6 +1398,8 @@ if [[ -n "${AFTER_DATA_TS_FIRST:-}" && -n "${INFO_DATA_TS_FIRST:-}" && "$INFO_DA
 fi
 XML_STATUS="UPDATED"
 XML_RUNTIME=$(( $(date -u +%s) - xml_started ))
+
+reject_downgrade "${INFO_TIMESTAMP:-$AFTER_TS}" "candidate extract ($(relpath "$EXTRACT_TMP"), mode=${UPDATE_MODE})"
 
 echo "Promoting validated extract and XML"
 promote_derived

@@ -4,8 +4,12 @@ __pycache__/
 *.pyc
 *.pyo
 
-# Secrets — never commit Strava session cookies
+# Secrets — never commit Strava session cookies or MapRoulette API keys
 .strava-cookie
+.maproulette-api-key
+
+# Local workflow / web UI state (no secrets, but machine-specific)
+state/
 
 # Tile and Overpass caches
 cache/

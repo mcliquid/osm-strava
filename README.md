@@ -53,13 +53,14 @@ Python 3 with:
 - [numpy](https://numpy.org/)
 - [shapely](https://pypi.org/project/shapely/)
 - [requests](https://pypi.org/project/requests/)
+- [Flask](https://pypi.org/project/Flask/) (only for the local web UI)
 
 Windows / PowerShell:
 
 ```
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-pip install pillow numpy shapely requests
+pip install pillow numpy shapely requests flask
 ```
 
 Tiles are cached under `cache/strava/` in this repository (not `/var/cache`).
@@ -473,11 +474,66 @@ warning (the way may not actually be in OSM yet).
 in the same round. Run offset 0, then 1, 2, 3, importing each GeoJSON before the
 next round. Combine with `-b` on later passes.
 
+## Local application
+
+The detector settings stay as validated (zoom 14, threshold 100, distance 35 m,
+minsize 20, parallel / ferry / heat-halo, plus golf on All). The workflow always
+passes `-z 14` from region config and always updates OSM with `--fresh`.
+`--dry-run` still runs fresh OSM and detection; it only skips MapRoulette writes.
+The workflow talks to MapRoulette over HTTP. It does **not** use mr-cli.
+
+API key (never commit):
+
+```
+MAPROULETTE_API_KEY
+```
+
+or the ignored file `.maproulette-api-key`.
+
+Dry-run (generates files, does not change MapRoulette):
+
+```
+python workflow.py mallorca --dry-run
+```
+
+Reuse already produced GeoJSON:
+
+```
+python workflow.py mallorca --dry-run --skip-osm --skip-detect --from-geojson-dir validation
+```
+
+Real run:
+
+```
+python workflow.py mallorca
+```
+
+Sequential production (map Ride/Run first, then refresh OSM and run All):
+
+```
+python workflow.py mallorca --phase ride-run
+python workflow.py mallorca --phase all
+```
+
+`--no-upload` is the same MapRoulette guard as `--dry-run`. New challenges are
+dated and stay `enabled=false`. Existing review history is never deleted.
+
+Local UI (127.0.0.1 only):
+
+```
+python webapp.py
+```
+
+Then open http://127.0.0.1:5000
+
 ## Other files
 
 - `strava.py` — current detector
 - `diagnostics.py` — shared geometry / diagnostics / suppression helpers
 - `analyze_diagnostics.py` — offline rule analysis
+- `workflow.py` — one-command region workflow
+- `maproulette.py` — MapRoulette HTTP client
+- `webapp.py` — local operator UI
 - `strava-ride.py` — older ride-oriented script (Overpass only; not the current detector)
 - `update-osm.ps1` / `update-osm.sh` — Geofabrik OSM extract updater
-- `osm-regions.conf` — region URLs, boundaries, and output paths
+- `osm-regions.conf` — region URLs, boundaries, challenge names, and output paths
