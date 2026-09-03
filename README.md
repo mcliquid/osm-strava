@@ -66,7 +66,28 @@ Tiles are cached under `cache/strava/` in this repository (not `/var/cache`).
 
 ### Direct Strava tiles
 
-`--strava-tiles strava` currently supports **`-c ride` only**. Authentication:
+`--strava-tiles strava` fetches authenticated Global Heatmap tiles. `-c`
+selects the heatmap sport layer (verified against `content-a.strava.com`):
+
+| `-c` | Heatmap layer | Notes |
+|---|---|---|
+| `ride` | `sport_Ride` | Mallorca production baseline |
+| `all` | `all` | Combined heatmap. `sport_All` returns HTTP 400 |
+| `run` | `sport_Run` | Public `-c run` mapping. Distinct from the raw `run` layer |
+
+Existing `-c ride --strava-tiles strava` commands are unchanged. Cache paths
+include the activity name, so Ride and All never share tiles:
+
+    cache/strava/ride/strava/<z>/<x>/<y>.png
+    cache/strava/all/strava/<z>/<x>/<y>.png
+    cache/strava/run/strava/<z>/<x>/<y>.png   # -c run → sport_Run
+
+`--strava-heatmap-layer` is experimental and selects the raw path segment
+(`sport_Ride`, `all`, `sport_Run`, `run`). `sport_Run` and `run` are different
+heatmaps. An override that differs from the `-c` default uses a separate cache
+stem (`run__run` for `-c run --strava-heatmap-layer run`).
+
+Authentication:
 
 - environment variable `STRAVA_COOKIE`, or
 - file `.strava-cookie` in the repository root
@@ -126,8 +147,9 @@ From `strava.py --help` (defaults in parentheses):
 |---|---|
 | `-a` / `--area` | Area GeoJSON (polygon/multipolygon). Tiles may overlap the boundary; only in-area candidate points are emitted |
 | `-x` / `-y` | Single Strava tile coordinates (debug; both required) |
-| `-c` / `--activity` | Activity (`run` default). Direct Strava tiles: `ride` only |
+| `-c` / `--activity` | Activity (`run` default). Direct Strava tiles: `ride`, `all`, or `run` |
 | `--strava-tiles` | `freemap` (default), `nakarte`, or `strava` |
+| `--strava-heatmap-layer` | Experimental raw direct-heatmap layer (`sport_Ride`, `all`, `sport_Run`, `run`) |
 | `-z` / `--zoom` | Tile zoom 10–15 (`15` default). Mallorca uses `14` |
 | `-m` / `--minlevel` | Intensity threshold 0–255 (`100`) |
 | `-s` / `--size` | Minimum component size in pixels (`20`) |

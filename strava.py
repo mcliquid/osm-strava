@@ -93,6 +93,8 @@ class RunStats:
         self.osm_index_objects = 0
         self.activity = None
         self.strava_backend = None
+        self.strava_heatmap_layer = None
+        self.strava_cache_namespace = None
         self.zoom = None
         self.threshold = None
         self.min_size = None
@@ -141,6 +143,8 @@ class RunStats:
             "output": self.output,
             "activity": self.activity,
             "strava_backend": self.strava_backend,
+            "strava_heatmap_layer": self.strava_heatmap_layer,
+            "strava_cache_namespace": self.strava_cache_namespace,
             "zoom": self.zoom,
             "threshold": self.threshold,
             "min_size": self.min_size,
@@ -200,6 +204,10 @@ class RunStats:
             line("Tile", self.tile)
         line("Activity", self.activity)
         line("Strava backend", self.strava_backend)
+        if self.strava_heatmap_layer:
+            line("Strava heatmap layer", self.strava_heatmap_layer)
+        if self.strava_cache_namespace and self.strava_cache_namespace != self.activity:
+            line("Strava cache namespace", self.strava_cache_namespace)
         line("Zoom", self.zoom)
         line("Threshold", self.threshold)
         line("Minimum size", f"{self.min_size} px")
@@ -299,6 +307,8 @@ diagnostic_osm = None
 suppress_parallel_osm = False
 suppress_ferry = False
 suppress_heat_halo = False
+strava_heatmap_layer = None
+strava_cache_namespace = None
 requested_area = None
 requested_area_prepared = None
 
@@ -369,6 +379,18 @@ _STRAVA_TILE_BROWSER_HEADERS = {
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:137.0) Gecko/20100101 Firefox/137.0",
 }
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+
+# Direct Global Heatmap path segment for --strava-tiles strava.
+# Probed 2026-09-02 against content-a.strava.com (.../grayscale/{z}/{x}/{y}@2x.png):
+#   sport_Ride HTTP 200, sport_Run HTTP 200, all HTTP 200, sport_All HTTP 400.
+_STRAVA_DIRECT_HEATMAP_LAYERS = {
+    "ride": "sport_Ride",
+    "all": "all",
+    "run": "sport_Run",
+}
+# Raw path segments accepted by --strava-heatmap-layer (experimental).
+# `run` and `sport_Run` are different heatmaps (probed 2026-09-02).
+_STRAVA_DIRECT_LAYER_OVERRIDE_CHOICES = ("sport_Ride", "all", "sport_Run", "run")
 
 # OSM tag filter shared by Overpass QL and local PBF import (keep value order stable).
 _OSM_HIGHWAY_VALUES = (
@@ -558,15 +580,27 @@ def print_strava_tile_debug(url, response, cache_file_path):
     print_verbose("Maximum:", int(np.max(positive)))
 
 
-# Check if Strava file is available in cache and download it if not in cache
+def strava_tile_cache_namespace(activity_name, heatmap_layer, default_layer):
+    """Cache stem under cache/strava/. Default activity paths stay stable.
+
+    An explicit layer that differs from the activity default gets its own
+    namespace so sport_Run and run never share PNG files. Ride cache is
+    unchanged when -c ride uses sport_Ride.
+    """
+    if heatmap_layer and default_layer and heatmap_layer != default_layer:
+        return f"{activity_name}__{heatmap_layer}"
+    return activity_name
+
+
 def fetch_strava_tile(zoom, x, y):
     cache_dir = os.path.join(
         os.path.dirname(os.path.abspath(__file__)),
         "cache",
         "strava"
     )
+    cache_stem = strava_cache_namespace or activity
     cache_file_path = os.path.join(
-        cache_dir, activity, strava_tile_backend, str(zoom), str(x), str(y) + '.png'
+        cache_dir, cache_stem, strava_tile_backend, str(zoom), str(x), str(y) + '.png'
     )
     if os.path.isfile(cache_file_path):
         if os.path.getsize(cache_file_path) > 0:
@@ -578,7 +612,7 @@ def fetch_strava_tile(zoom, x, y):
             run_stats.strava_tiles_from_cache += 1
             run_stats.tiles_processed += 1
             return None
-    dir1 = os.path.join(cache_dir, activity, strava_tile_backend, str(zoom))
+    dir1 = os.path.join(cache_dir, cache_stem, strava_tile_backend, str(zoom))
     if not os.path.isdir(dir1):
         os.makedirs(dir1, exist_ok=True)
     dir2 = os.path.join(dir1, str(x))
@@ -587,8 +621,10 @@ def fetch_strava_tile(zoom, x, y):
 
     headers = dict(_STRAVA_TILE_BROWSER_HEADERS)
     if strava_tile_backend == "strava":
+        layer = strava_heatmap_layer or _STRAVA_DIRECT_HEATMAP_LAYERS.get(activity)
         url = (
-            "https://content-a.strava.com/identified/globalheat/sport_Ride/grayscale/"
+            "https://content-a.strava.com/identified/globalheat/"
+            f"{layer}/grayscale/"
             f"{zoom}/{x}/{y}@2x.png?v=20&missing=empty"
         )
         headers["Origin"] = "https://www.strava.com"
@@ -1442,6 +1478,7 @@ def check_strava_tile(polygon_area, x, y, zoom):
         if strava_tile is None:
             run_stats.tiles_empty += 1
             return
+        image = None
         try:
             image = Image.open(strava_tile)
             if strava_tile_backend == "strava":
@@ -1450,7 +1487,15 @@ def check_strava_tile(polygon_area, x, y, zoom):
             print(f"Warning: Invalid Strava tile {strava_tile}", file=sys.stderr)
             run_stats.note_warning()
             run_stats.tiles_failed += 1
-            os.remove(strava_tile)
+            if image is not None:
+                try:
+                    image.close()
+                except Exception:
+                    pass
+            try:
+                os.remove(strava_tile)
+            except OSError:
+                pass
             return
         run_stats.tiles_processed += 1
         data = np.array(image)
@@ -1742,13 +1787,29 @@ parser.add_argument("-s", "--size", type=int, default=20,
 parser.add_argument("-z", "--zoom", type=int, default=15,
                     help="Strava zoom level (10-15)")
 parser.add_argument("-c", "--activity", default='run',
-                    help="Strava activity (default=run). Use e.g. 'all' for combined heatmap with --strava-tiles nakarte.")
+                    help=(
+                        "Strava activity (default=run). Direct Strava tiles "
+                        "(--strava-tiles strava): ride, all, or run "
+                        "(heatmap layers sport_Ride, all, sport_Run). "
+                        "Nakarte/freemap use this value in the tile path; "
+                        "use e.g. 'all' for the combined heatmap there."
+                    ))
 parser.add_argument(
     "--strava-tiles",
     dest="strava_tile_backend",
     choices=("freemap", "nakarte", "strava"),
     default="freemap",
     help="Strava tile server: 'freemap' (default), 'nakarte' (proxy to heatmap-external-a.strava.com, px=256), or 'strava' (direct Global Heatmap, requires .strava-cookie).",
+)
+parser.add_argument(
+    "--strava-heatmap-layer",
+    dest="strava_heatmap_layer_override",
+    choices=_STRAVA_DIRECT_LAYER_OVERRIDE_CHOICES,
+    help=(
+        "Experimental: raw direct-heatmap path segment (sport_Ride, all, "
+        "sport_Run, run). Default is the -c mapping. sport_Run and run are "
+        "different layers. Does not change -c run unless this flag is set."
+    ),
 )
 parser.add_argument("-o", "--offset", type=int,
                     help="Strava tile offset (0-3)")
@@ -1832,6 +1893,35 @@ activity = args.activity
 print_verbose("Activity = ", activity)
 strava_tile_backend = args.strava_tile_backend
 print_verbose("Strava tiles =", strava_tile_backend)
+if args.strava_heatmap_layer_override and strava_tile_backend != "strava":
+    print(
+        "Error: --strava-heatmap-layer is only valid with --strava-tiles strava.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+strava_heatmap_layer = None
+strava_cache_namespace = None
+if strava_tile_backend == "strava":
+    default_layer = _STRAVA_DIRECT_HEATMAP_LAYERS.get(activity)
+    override = args.strava_heatmap_layer_override
+    if override:
+        strava_heatmap_layer = override
+    else:
+        strava_heatmap_layer = default_layer
+        if strava_heatmap_layer is None:
+            print(
+                "Error: --strava-tiles strava supports -c ride, -c all, or -c run "
+                "(heatmap layers sport_Ride, all, sport_Run). "
+                "Use --strava-heatmap-layer run to fetch the distinct raw 'run' layer.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+    strava_cache_namespace = strava_tile_cache_namespace(
+        activity, strava_heatmap_layer, default_layer
+    )
+    print_verbose("Strava heatmap layer =", strava_heatmap_layer)
+    if strava_cache_namespace != activity:
+        print_verbose("Strava cache namespace =", strava_cache_namespace)
 if args.osm_file:
     print_verbose("OSM file =", args.osm_file)
 else:
@@ -1839,12 +1929,6 @@ else:
     print_verbose("Overpass URL =", overpass_url)
 strava_cookie = None
 if strava_tile_backend == "strava":
-    if activity != "ride":
-        print(
-            "Error: --strava-tiles strava currently supports only -c ride.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
     strava_cookie = load_strava_cookie()
 tasks_db = args.tasks_db
 osm_index = None
@@ -1852,6 +1936,8 @@ con = None
 
 run_stats.activity = activity
 run_stats.strava_backend = strava_tile_backend
+run_stats.strava_heatmap_layer = strava_heatmap_layer
+run_stats.strava_cache_namespace = strava_cache_namespace
 run_stats.zoom = zoom
 run_stats.threshold = threshold
 run_stats.min_size = min_size
