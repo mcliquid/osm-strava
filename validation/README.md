@@ -51,8 +51,8 @@ Do not treat them as a MapRoulette challenge.
 `--diagnostics` can record OSM **area** context beside the usual way metrics
 (`open_area_class`, `open_area_center_inside`, `open_area_component_inside_frac`,
 `open_area_component_crosses_boundary`, `open_area_component_stays_inside`, …).
-Those objects are loaded only for diagnostics and are **not** part of the heatmap
-mask and **not** used by any suppressor.
+Those objects are not part of the heatmap mask. Optional `--suppress-golf` uses
+the same `stays_inside leisure=golf_course` geometry (All layer only).
 
 Offline review of the Mallorca samples:
 
@@ -71,4 +71,4 @@ Remaining candidates are:
 
 Do not reconstruct suppression from metric thresholds for that snapshot.
 The CSV flags (`suppressed_parallel_osm`, `suppressed_ferry`,
-`suppressed_heat_halo`, `written_to_geojson`) are authoritative.
+`suppressed_heat_halo`, `suppressed_golf`, `written_to_geojson`) are authoritative.

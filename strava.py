@@ -31,6 +31,9 @@ from diagnostics import (
     component_osm_follow_metrics,
     nearest_ferry_distance_m,
     osm_open_area_tags_match,
+    extract_component_pixels,
+    golf_stays_inside_for_candidate,
+    pixels_to_mercator,
     should_suppress_ferry,
     should_suppress_heat_halo,
     should_suppress_parallel_osm,
@@ -84,6 +87,8 @@ class RunStats:
         self.ferry_suppressed = 0
         self.heat_halo_suppressed = 0
         self.heat_halo_additional_suppressed = 0
+        self.golf_suppressed = 0
+        self.golf_additional_suppressed = 0
         self.suppression_overlap = 0
         self.total_suppressed = 0
         self.geojson_features = 0
@@ -109,6 +114,7 @@ class RunStats:
         self.suppress_parallel_osm = False
         self.suppress_ferry = False
         self.suppress_heat_halo = False
+        self.suppress_golf = False
 
     def note_warning(self):
         self.warnings_total += 1
@@ -172,11 +178,14 @@ class RunStats:
             "ferry_suppressed": self.ferry_suppressed,
             "heat_halo_suppressed": self.heat_halo_suppressed,
             "heat_halo_additional_suppressed": self.heat_halo_additional_suppressed,
+            "golf_suppressed": self.golf_suppressed,
+            "golf_additional_suppressed": self.golf_additional_suppressed,
             "suppression_overlap": self.suppression_overlap,
             "total_suppressed": self.total_suppressed,
             "suppress_parallel_osm": self.suppress_parallel_osm,
             "suppress_ferry": self.suppress_ferry,
             "suppress_heat_halo": self.suppress_heat_halo,
+            "suppress_golf": self.suppress_golf,
             "geojson_features": self.geojson_features,
             "warnings_total": self.warnings_total,
             "started": started,
@@ -280,8 +289,23 @@ class RunStats:
                 "Heat-halo additional suppressed",
                 _format_int(self.heat_halo_additional_suppressed),
             )
+        elif self.suppress_golf:
+            line("Accepted before golf suppression", _format_int(self.detections_accepted))
+            line("Suppressed golf-course traces", _format_int(self.golf_suppressed))
+            line(
+                "Golf additional suppressed",
+                _format_int(self.golf_additional_suppressed),
+            )
         else:
             line("Accepted detections", _format_int(self.detections_accepted))
+        if self.suppress_golf and (
+            self.suppress_parallel_osm or self.suppress_ferry or self.suppress_heat_halo
+        ):
+            line("Suppressed golf-course traces", _format_int(self.golf_suppressed))
+            line(
+                "Golf additional suppressed",
+                _format_int(self.golf_additional_suppressed),
+            )
         print("", file=stream)
         line("GeoJSON features", _format_int(self.geojson_features))
         if self.output:
@@ -308,6 +332,7 @@ diagnostic_osm = None
 suppress_parallel_osm = False
 suppress_ferry = False
 suppress_heat_halo = False
+suppress_golf = False
 strava_heatmap_layer = None
 strava_cache_namespace = None
 requested_area = None
@@ -1234,7 +1259,10 @@ def load_osm_index_from_xml(osm_path, south, west, north, east):
         tags = {k: v for k, v in pairs}
         is_relevant = osm_tags_match_pairs(pairs)
         is_construction = collect_diagnostic_osm and _is_construction_pairs(pairs)
-        is_open_area = collect_diagnostic_osm and osm_open_area_tags_match(tags)
+        is_open_area = (
+            (collect_diagnostic_osm or suppress_golf)
+            and osm_open_area_tags_match(tags)
+        )
         if not is_relevant and not is_construction and not is_open_area:
             continue
         osm_id = elem.attrib.get("id", "")
@@ -1264,7 +1292,10 @@ def load_osm_index_from_xml(osm_path, south, west, north, east):
         node_refs = _way_node_refs(elem)
         matches = osm_tags_match_pairs(pairs)
         is_construction = collect_diagnostic_osm and _is_construction_pairs(pairs)
-        is_open_area = collect_diagnostic_osm and osm_open_area_tags_match(tags)
+        is_open_area = (
+            (collect_diagnostic_osm or suppress_golf)
+            and osm_open_area_tags_match(tags)
+        )
         if matches or is_construction or is_open_area or osm_id in member_way_ids:
             needed_node_ids.update(node_refs)
         if matches:
@@ -1351,6 +1382,7 @@ def load_osm_index_from_xml(osm_path, south, west, north, east):
             f"Diagnostic construction objects: {len(construction_items)} "
             f"(highway=construction is also masked as existing OSM geometry)"
         )
+    if collect_diagnostic_osm or suppress_golf:
         open_area_items = []
         for osm_id, pairs, node_refs in (
             (wid, pdata[0], pdata[1]) for wid, pdata in open_area_ways.items()
@@ -1379,7 +1411,7 @@ def load_osm_index_from_xml(osm_path, south, west, north, east):
         osm_index.open_area_items = open_area_items
         print_verbose(
             f"Diagnostic open-area objects: {len(open_area_items)} "
-            f"(not used for masking or suppression)"
+            f"(not used for heatmap masking; optional --suppress-golf only)"
         )
     run_stats.osm_source = f"local XML ({os.path.basename(osm_path)})"
     run_stats.osm_ways = osm_index.n_ways
@@ -1515,7 +1547,7 @@ def _draw_open_area_items_from_way(osm_id, tags, coords):
         fill,
         coords,
         envelope,
-        _item_tags_payload(tags),
+        {k: v for k, v in tags},
     ))
     return items
 
@@ -1523,7 +1555,7 @@ def _draw_open_area_items_from_way(osm_id, tags, coords):
 def _draw_open_area_items_from_relation(osm_id, tags, way_members):
     # Always treat matching open-area relations as filled outers.
     items = []
-    tag_payload = _item_tags_payload(tags)
+    tag_payload = {k: v for k, v in tags}
     outer_coords = [coords for role, coords in way_members if role == "outer" and coords]
     if not outer_coords:
         outer_coords = [coords for _role, coords in way_members if coords]
@@ -1542,6 +1574,7 @@ def setup_diagnostic_osm(loaded_index):
         or suppress_parallel_osm
         or suppress_ferry
         or suppress_heat_halo
+        or suppress_golf
     )
     if not need_lookup or loaded_index is None:
         diagnostic_osm = None
@@ -1657,6 +1690,7 @@ def check_strava_tile(polygon_area, x, y, zoom):
             diagnostic_writer is not None
             or suppress_parallel_osm
             or suppress_heat_halo
+            or suppress_golf
         )
         need_lookup = need_component_geometry or suppress_ferry
         if need_lookup and tile_lookup is None:
@@ -1675,6 +1709,7 @@ def check_strava_tile(polygon_area, x, y, zoom):
             suppressed_parallel = False
             suppressed_ferry_flag = False
             suppressed_heat_halo_flag = False
+            suppressed_golf_flag = False
             too_small = size <= min_size
             inside_area = candidate_inside_requested_area(result[0], result[1])
             accepted = (not too_small) and inside_area
@@ -1765,12 +1800,54 @@ def check_strava_tile(polygon_area, x, y, zoom):
                             f"Suppressed heat halo: "
                             f"{zoom}/{x}/{y}/{int(max_index[0])}/{int(max_index[1])}"
                         )
+                if suppress_golf:
+                    try:
+                        values, rows, cols = extract_component_pixels(
+                            heatmap_snapshot,
+                            int(max_index[0]),
+                            int(max_index[1]),
+                            threshold,
+                        )
+                        component_xy = None
+                        if values.size and bbox_merc is not None:
+                            component_xy = pixels_to_mercator(
+                                rows, cols, bbox_merc, pixel_size
+                            )
+                        open_lookup = None
+                        if tile_lookup is not None:
+                            open_lookup = getattr(tile_lookup, "open_areas", None)
+                        suppressed_golf_flag, _golf_pred = golf_stays_inside_for_candidate(
+                            lon2x(result[0]),
+                            lat2y(result[1]),
+                            component_xy,
+                            open_lookup,
+                        )
+                    except Exception as exc:
+                        print(
+                            f"Warning: golf suppression failed: {exc}",
+                            file=sys.stderr,
+                        )
+                        run_stats.note_warning()
+                        suppressed_golf_flag = False
+                    if suppressed_golf_flag:
+                        run_stats.golf_suppressed += 1
+                        if (
+                            not suppressed_parallel
+                            and not suppressed_ferry_flag
+                            and not suppressed_heat_halo_flag
+                        ):
+                            run_stats.golf_additional_suppressed += 1
+                        print_verbose(
+                            f"Suppressed golf stays_inside: "
+                            f"{zoom}/{x}/{y}/{int(max_index[0])}/{int(max_index[1])}"
+                        )
                 if suppressed_parallel and suppressed_ferry_flag:
                     run_stats.suppression_overlap += 1
                 if (
                     suppressed_parallel
                     or suppressed_ferry_flag
                     or suppressed_heat_halo_flag
+                    or suppressed_golf_flag
                 ):
                     run_stats.total_suppressed += 1
                 # print(f"geo:{result[1]},{result[0]}?z={zoom}")
@@ -1796,6 +1873,7 @@ def check_strava_tile(polygon_area, x, y, zoom):
                     not suppressed_parallel
                     and not suppressed_ferry_flag
                     and not suppressed_heat_halo_flag
+                    and not suppressed_golf_flag
                     and status != "Too_Hard"
                     and status != "Not_an_Issue"
                 ):
@@ -1856,6 +1934,7 @@ def check_strava_tile(polygon_area, x, y, zoom):
                         suppressed_parallel_osm=suppressed_parallel,
                         suppressed_ferry=suppressed_ferry_flag,
                         suppressed_heat_halo=suppressed_heat_halo_flag,
+                        suppressed_golf=suppressed_golf_flag,
                     )
                     diagnostic_writer.write_row(row)
                     run_stats.diagnostic_rows = diagnostic_writer.rows_written
@@ -1975,6 +2054,17 @@ parser.add_argument(
         "not change masking, thresholds, or candidate IDs."
     ),
 )
+parser.add_argument(
+    "--suppress-golf",
+    action="store_true",
+    help=(
+        "Opt-in: All heatmap only. Omit accepted candidates whose leftover heat "
+        "stays almost entirely inside leisure=golf_course (center inside, "
+        "component_inside_frac>=0.90, does not cross the golf-course boundary). "
+        "Default off. Does not suppress paths that only touch or cross a golf "
+        "course. Does not apply to sport_Ride, sport_Run, or run."
+    ),
+)
 
 args = parser.parse_args()
 
@@ -2063,6 +2153,26 @@ suppress_heat_halo = bool(args.suppress_heat_halo)
 run_stats.suppress_heat_halo = suppress_heat_halo
 if suppress_heat_halo:
     print_verbose("Suppress heat halo = on (between_heat_ratio>=1.0)")
+suppress_golf = bool(args.suppress_golf)
+if suppress_golf:
+    layer_is_all = False
+    if strava_tile_backend == "strava":
+        layer_is_all = strava_heatmap_layer == "all"
+    else:
+        layer_is_all = activity == "all"
+    if not layer_is_all:
+        print(
+            "Error: --suppress-golf applies only to the All heatmap layer "
+            "(-c all, or --strava-heatmap-layer all). "
+            "It does not apply to sport_Ride, sport_Run, or run.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+run_stats.suppress_golf = suppress_golf
+if suppress_golf:
+    print_verbose(
+        "Suppress golf = on (stays_inside leisure=golf_course; All layer only)"
+    )
 
 # Create output file
 if args.geojson is not None:

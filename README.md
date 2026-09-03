@@ -168,6 +168,7 @@ From `strava.py --help` (defaults in parentheses):
 | `--suppress-parallel-osm` | Opt-in parallel-OSM suppression (default off) |
 | `--suppress-ferry` | Opt-in ferry-candidate suppression (default off) |
 | `--suppress-heat-halo` | Opt-in lateral heat-halo suppression (default off) |
+| `--suppress-golf` | Opt-in All-layer golf stays-inside suppression (default off) |
 
 Area polygons can be downloaded from [OSM-Boundaries](https://osm-boundaries.com/).
 Example files live in `boundaries/`. Candidate output is clipped to the polygon
@@ -225,6 +226,32 @@ Validated on MapRoulette challenge 56715 (47 leftover Not_An_Issue after the
 existing production filters): `>= 1.0` removes 36/47 NAI. The reconstructed
 Fixed control `14/8308/6230/389/806` (`between_heat_ratio = 0`) and all four
 Too_Hard controls survive.
+
+### `--suppress-golf`
+
+Opt-in, default **off**. Applies **only** to the combined All heatmap layer
+(`-c all` / heatmap path `all`). It does **not** run on `sport_Ride`,
+`sport_Run`, or `run`.
+
+Omits accepted leftover heat that stays almost entirely inside an OSM
+`leisure=golf_course` polygon:
+
+    center inside golf_course
+    AND component_inside_frac >= 0.90
+    AND the component does not cross the golf-course boundary
+
+This is the validated `stays_inside golf_course` predicate from the complete
+Mallorca All-only review (292 tasks). It is **not** a generic golf-course OSM
+filter: candidates merely near a course, that only touch it, or that cross
+its boundary are kept (useful missing connections).
+
+Mallorca All-only ground truth: 35/67 Not_An_Issue, 1/219 positives
+(`14/8319/6228/191/310`, accepted trade-off). Crossing Fixed
+`14/8320/6233/446/681` survives.
+
+Diagnostics column: `suppressed_golf`. Stats: `golf_suppressed` (predicate
+matches) and `golf_additional_suppressed` (GeoJSON removals not already
+caught by a previous enabled rule).
 
 ### Combined statistics
 
@@ -410,7 +437,7 @@ Main diagnostic groups (not a full column list):
 - nearest ferry / construction
 - follow / parallel geometry vs local OSM
 - area membership (`inside_area`)
-- suppression status (`suppressed_parallel_osm`, `suppressed_ferry`, `suppressed_heat_halo`, `written_to_geojson`)
+- suppression status (`suppressed_parallel_osm`, `suppressed_ferry`, `suppressed_heat_halo`, `suppressed_golf`, `written_to_geojson`)
 
 Generated analysis CSV/GeoJSON files are gitignored.
 

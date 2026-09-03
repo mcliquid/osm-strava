@@ -121,6 +121,7 @@ DIAGNOSTIC_COLUMNS = [
     "suppressed_parallel_osm",
     "suppressed_ferry",
     "suppressed_heat_halo",
+    "suppressed_golf",
 ]
 
 # Diagnostic-only open-area classes. Not part of the OSM mask universe.
@@ -139,7 +140,9 @@ OPEN_AREA_CLASSES = (
     "playground",
 )
 _OPEN_AREA_SEARCH_M = 250.0
+_OPEN_AREA_FAR_SEARCH_M = 2000.0
 _OPEN_AREA_CROSS_EPS = 1e-6
+GOLF_STAYS_INSIDE_FRAC_MIN = 0.90
 
 
 def _fmt_float(value, digits=6):
@@ -778,6 +781,133 @@ class OpenAreaLookup:
         return out
 
 
+def evaluate_open_area_class_predicates(
+    merc_x,
+    merc_y,
+    component_merc_xy,
+    open_area_lookup,
+    cls,
+):
+    """Containment predicates for one open-area class.
+
+    Shared by diagnostics and optional `--suppress-golf`. Mallorca All-only
+    validation used this exact stays_inside golf_course definition.
+    """
+    empty = {
+        "has_nearby": False,
+        "center_inside": False,
+        "distance_m": None,
+        "inside_frac": None,
+        "majority_inside": False,
+        "near_entire_inside": False,
+        "entire_inside": False,
+        "crosses": False,
+        "stays_inside": False,
+        "osm_id": "",
+        "name": "",
+    }
+    if open_area_lookup is None or len(open_area_lookup) == 0:
+        return empty
+
+    point = Point(merc_x, merc_y)
+    nearby = [
+        (item, geom)
+        for item, geom, c in open_area_lookup.candidates_near(merc_x, merc_y)
+        if c == cls
+    ]
+    if not nearby and getattr(open_area_lookup, "_tree", None) is not None:
+        env = shapely_box(
+            merc_x - _OPEN_AREA_FAR_SEARCH_M,
+            merc_y - _OPEN_AREA_FAR_SEARCH_M,
+            merc_x + _OPEN_AREA_FAR_SEARCH_M,
+            merc_y + _OPEN_AREA_FAR_SEARCH_M,
+        )
+        idxs = np.asarray(
+            open_area_lookup._tree.query(env, predicate="intersects")
+        ).reshape(-1)
+        for i in idxs:
+            if open_area_lookup._classes[int(i)] != cls:
+                continue
+            nearby.append(
+                (open_area_lookup._items[int(i)], open_area_lookup._geoms[int(i)])
+            )
+
+    if not nearby:
+        return empty
+
+    best = None
+    for item, geom in nearby:
+        dist = float(geom.distance(point))
+        inside = False
+        if geom.geom_type in ("Polygon", "MultiPolygon"):
+            inside = bool(geom.contains(point) or geom.covers(point))
+        elif dist <= _OPEN_AREA_CROSS_EPS:
+            inside = True
+        score = (0 if inside else 1, dist)
+        if best is None or score < best[0]:
+            best = (score, item, geom, dist, inside)
+    _score, item, geom, dist, center_inside = best
+
+    inside_frac = None
+    crosses = False
+    if component_merc_xy is not None and len(component_merc_xy) > 0:
+        n = len(component_merc_xy)
+        inside_n = 0
+        outside_n = 0
+        band = 5.0 if geom.geom_type not in ("Polygon", "MultiPolygon") else 0.0
+        for xy in component_merc_xy:
+            pt = Point(float(xy[0]), float(xy[1]))
+            if geom.geom_type in ("Polygon", "MultiPolygon"):
+                ok = (
+                    geom.contains(pt)
+                    or geom.covers(pt)
+                    or geom.distance(pt) <= _OPEN_AREA_CROSS_EPS
+                )
+            else:
+                ok = geom.distance(pt) <= band
+            if ok:
+                inside_n += 1
+            else:
+                outside_n += 1
+        inside_frac = inside_n / n
+        crosses = inside_n > 0 and outside_n > 0
+
+    majority = inside_frac is not None and inside_frac >= 0.5
+    near_entire = (
+        inside_frac is not None and inside_frac >= GOLF_STAYS_INSIDE_FRAC_MIN
+    )
+    entire = inside_frac is not None and inside_frac >= 0.99
+    stays = bool(center_inside and near_entire and not crosses)
+
+    return {
+        "has_nearby": True,
+        "center_inside": center_inside,
+        "distance_m": dist,
+        "inside_frac": inside_frac,
+        "majority_inside": majority,
+        "near_entire_inside": near_entire,
+        "entire_inside": entire,
+        "crosses": crosses,
+        "stays_inside": stays,
+        "osm_id": str(item.osm_id),
+        "name": (item.tags or {}).get("name", ""),
+    }
+
+
+def should_suppress_golf(golf_pred):
+    """True for validated stays_inside leisure=golf_course. No proximity match."""
+    return bool(golf_pred) and bool(golf_pred.get("stays_inside"))
+
+
+def golf_stays_inside_for_candidate(
+    merc_x, merc_y, component_merc_xy, open_area_lookup
+):
+    pred = evaluate_open_area_class_predicates(
+        merc_x, merc_y, component_merc_xy, open_area_lookup, "golf_course"
+    )
+    return should_suppress_golf(pred), pred
+
+
 def open_area_metrics_for_candidate(
     merc_x,
     merc_y,
@@ -1307,6 +1437,7 @@ def build_diagnostic_row(
     suppressed_parallel_osm=False,
     suppressed_ferry=False,
     suppressed_heat_halo=False,
+    suppressed_golf=False,
     inside_area=True,
 ):
     candidate_id = f"{zoom}/{tile_x}/{tile_y}/{peak_row}/{peak_col}"
@@ -1408,6 +1539,7 @@ def build_diagnostic_row(
     row["suppressed_parallel_osm"] = _bool_csv(suppressed_parallel_osm)
     row["suppressed_ferry"] = _bool_csv(suppressed_ferry)
     row["suppressed_heat_halo"] = _bool_csv(suppressed_heat_halo)
+    row["suppressed_golf"] = _bool_csv(suppressed_golf)
     return row
 
 
