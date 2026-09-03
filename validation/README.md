@@ -29,6 +29,23 @@ python analyze_diagnostics.py diagnostics-mallorca-filtered-v2.csv validation/ch
 Generated `analysis-*`, `remaining-*`, `rule-results.csv`, and similar files are
 gitignored.
 
+## Mallorca heatmap-layer review samples
+
+Local review files (gitignored), built from FINAL Mallorca candidates after
+parallel, ferry, and heat-halo suppression. Spatial matching is 25 m on
+center coordinates, not `candidate_id`.
+
+```
+python validation/sample_heatmap_review.py
+```
+
+- `run-sample.geojson` / `run-sample.csv` — ~50 `sport_Run` finals with no Ride final within 25 m
+- `all-only-sample.geojson` / `all-only-sample.csv` — ~50 All finals with no Ride and no `sport_Run` final within 25 m
+
+Sampling is deterministic: per OSM class, farthest-point from the westernmost
+candidate, tie-broken by `candidate_id`. These files are for manual review only.
+Do not treat them as a MapRoulette challenge.
+
 ## Production Remaining
 
 When the diagnostics CSV comes from a run with suppression flags enabled,
